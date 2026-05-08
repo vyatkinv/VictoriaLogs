@@ -22,6 +22,8 @@ according to the following docs:
 
 ## tip
 
+* SECURITY: upgrade Go builder from Go1.26.2 to Go1.26.3. See [the list of issues addressed in Go1.26.3](https://github.com/golang/go/issues?q=milestone%3AGo1.26.3%20label%3ACherryPickApproved).
+
 * FEATURE: [querying API](https://docs.victoriametrics.com/victorialogs/querying/): allow using [`limit`](https://docs.victoriametrics.com/victorialogs/logsql/#limit-pipe) and [`offset`](https://docs.victoriametrics.com/victorialogs/logsql/#offset-pipe) pipes after the [`stats` pipe](https://docs.victoriametrics.com/victorialogs/logsql/#stats-pipe) in queries to [`/select/logsql/stats_query`](https://docs.victoriametrics.com/victorialogs/querying/#querying-log-stats). This enables the usage for these pipes in [alerting and recording rules for VictoriaLogs](https://docs.victoriametrics.com/victorialogs/vmalert/). See [#1296](https://github.com/VictoriaMetrics/VictoriaLogs/issues/1296).
 * FEATURE: [alerts](https://github.com/VictoriaMetrics/VictoriaLogs/blob/master/deployment/docker/rules): add new alerting rules `PersistentQueueRunsOutOfSpaceIn12Hours` and `PersistentQueueRunsOutOfSpaceIn4Hours` for `vlagent` persistent queue capacity. These alerts help users to take proactive actions before `vlagent` starts dropping logs due to insufficient persistent queue space. See [#10193](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10193)
 * FEATURE: [web UI](https://docs.victoriametrics.com/victorialogs/querying/#web-ui): remove the `Date format` setting and always display timestamps with nanosecond precision. See [#1161](https://github.com/VictoriaMetrics/VictoriaLogs/issues/1161).
