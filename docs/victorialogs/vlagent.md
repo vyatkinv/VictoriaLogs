@@ -766,13 +766,13 @@ according to [these docs](https://docs.victoriametrics.com/victoriametrics/vmaut
 
 `vlagent` supports DNS SRV resolution in `-remoteWrite.url` when the hostname starts with `srv+`. For example, if DNS contains SRV records for `victoria-logs`, then:
 
-```
+```sh
 -remoteWrite.url=http://srv+victoria-logs/insert/native
 ```
 
 When vlagent creates a new TCP connection to the remote endpoint, it resolves the SRV record and uses one of the returned `target:port` addresses, for example:
 
-```
+```sh
 -remoteWrite.url=http://victoria-logs-host:9428/insert/native
 ```
 
