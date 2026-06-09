@@ -1839,8 +1839,9 @@ func (q *Query) initStatsRateFuncsFromTimeFilter() {
 	if start != math.MinInt64 && end != math.MaxInt64 {
 		step := end - start
 
-		// The increment of the step is needed in order to cover the
-		// last nanosecond in the selected time range [start, end].
+		// The HTTP layer already converted the exclusive end into end-1, and the _time
+		// filter is inclusive ([start, end]). So (end - start) is 1ns short of the real
+		// So the increment of the step is needed in order to add that 1ns back
 		step++
 
 		q.initStatsRateFuncs(step)
