@@ -2,6 +2,7 @@ package logstorage
 
 import (
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -91,6 +92,7 @@ func (pu *pipeUnpackSyslog) newPipeProcessor(_ int, _ <-chan struct{}, _ func(),
 		year := currentYear.Load()
 		p := GetSyslogParser(int(year), pu.offsetTimezone)
 
+		s = strings.TrimLeft(s, " \t\n\r")
 		p.Parse(s)
 		for _, f := range p.Fields {
 			uctx.addField(f.Name, f.Value)
