@@ -581,6 +581,18 @@ VictoriaLogs uses server-side timezone in the following cases:
 VictoriaLogs obtains the local timezone from the `TZ` environment variable. It expects valid [IANA Time Zone identifiers](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
 in the `TZ` environment variable. Set `TZ` environment variable to an empty string - `TZ=""` - for using UTC.
 
+## vmalert
+
+VictoriaLogs can proxy requests to [vmalert](https://docs.victoriametrics.com/victorialogs/vmalert/) if the `-vmalert.proxyURL` command-line flag
+is set to vmalert url. For example, the following command instructs proxying `http://victoria-logs:9428/select/vmalert/*` requests to `http://vmalert:8880/vmalert/*`:
+
+```sh
+/path/to/victoria-logs -vmalert.proxyURL=http://vmalert:8880/
+```
+
+This allows accessing [vmalert web UI](https://docs.victoriametrics.com/victoriametrics/vmalert/#web) via VictoriaLogs
+at the `/select/vmalert/*` paths.
+
 ## List of command-line flags
 
 Pass `-help` to VictoriaLogs in order to see the list of supported command-line flags with their description:
