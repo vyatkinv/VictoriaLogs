@@ -16,6 +16,7 @@ aliases:
 Benchmarking and Comparisons:
 
 * [Victorialogs vs Loki - Benchmarking Results](https://www.truefoundry.com/blog/victorialogs-vs-loki)
+* [We rebuilt project logging at Zerops on VictoriaLogs](https://zerops.io/articles/we-rebuilt-project-logging-at-zerops-on-victoria-logs)
 * [VictoriaLogs: The Space-Efficient Alternative to Elasticsearch for Log Management](https://medium.com/@kienlt.qn/victorialogs-the-space-efficient-alternative-to-elasticsearch-for-log-management-b9948f4ef05c)
 * [Grafana vs. VictoriaLogs vs. Datadog: Real Engineers Weigh In on Observability Stacks](https://medium.com/@PlanB./grafana-vs-victorialogs-vs-datadog-real-engineers-weigh-in-on-observability-stacks-1699558e62c6)
 * [Grepping logs remains terrible](https://chronicles.mad-scientist.club/tales/grepping-logs-remains-terrible/)
