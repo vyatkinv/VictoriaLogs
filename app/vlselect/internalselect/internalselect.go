@@ -24,7 +24,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/logstorage"
 )
 
-var maxConcurrentRequests = flag.Int("internalselect.maxConcurrentRequests", 100, "The limit on the number of concurrent requests to /internal/select/* endpoints; "+
+var maxConcurrentRequests = flag.Int("internalselect.maxConcurrentRequests", 8, "The limit on the number of concurrent requests to /internal/select/* endpoints; "+
 	"other requests are put into the wait queue; see https://docs.victoriametrics.com/victorialogs/cluster/")
 
 // RequestHandler processes requests to /internal/select/*
