@@ -23,6 +23,7 @@ according to the following docs:
 ## tip
 
 * BUGFIX: [cluster version](https://docs.victoriametrics.com/victorialogs/cluster/): `vlstorage` now returns the error and stops processing an `/internal/select/*` request when the request cannot be parsed, instead of continuing to handle it and writing the response twice.
+* BUGFIX: [cluster version](https://docs.victoriametrics.com/victorialogs/cluster/): bump the internal protocol version for the delete endpoints, which switched to multipart encoding in [v1.51.0](https://github.com/VictoriaMetrics/VictoriaLogs/releases/tag/v1.51.0) but kept the previous version. A version mismatch between `vlselect` and `vlstorage` for delete requests is now reported instead of silently mishandled. All cluster components must be upgraded together to use delete.
 
 ## [v1.51.0](https://github.com/VictoriaMetrics/VictoriaLogs/releases/tag/v1.51.0)
 
