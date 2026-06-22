@@ -1,5 +1,5 @@
 // The list of supported units could be the following -
-// https://prometheus.io/docs/prometheus/latest/querying/basics/#time-durations
+// https://prometheus.io/docs/prometheus/latest/querying/basics/#float-literals-and-time-durations
 import { TimePeriod } from "../../types";
 import { vmDate } from "./vmDate";
 import { absNanoseconds, NANOSECONDS_PER_MILLISECOND } from "./nano";
