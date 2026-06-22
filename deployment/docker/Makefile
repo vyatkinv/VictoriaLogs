@@ -4,7 +4,6 @@ DOCKER_REGISTRIES ?= docker.io quay.io
 DOCKER_NAMESPACE ?= victoriametrics
 
 ROOT_IMAGE ?= gcr.io/distroless/static:latest@sha256:47b2d72ff90843eb8a768b5c2f89b40741843b639d065b9b937b07cd59b479c6
-CERTS_IMAGE := gcr.io/distroless/static:latest@sha256:47b2d72ff90843eb8a768b5c2f89b40741843b639d065b9b937b07cd59b479c6
 
 GO_BUILDER_IMAGE := golang:1.26.4
 
@@ -60,7 +59,6 @@ publish-via-docker:
 		app-via-docker-linux-ppc64le
 	$(DOCKER) buildx build \
 		--platform=linux/amd64,linux/arm,linux/arm64,linux/ppc64le \
-		--build-arg certs_image=$(CERTS_IMAGE) \
 		--build-arg root_image=$(ROOT_IMAGE) \
 		--build-arg APP_NAME=$(APP_NAME) \
 		--build-arg BINARY_SUFFIX="" \
