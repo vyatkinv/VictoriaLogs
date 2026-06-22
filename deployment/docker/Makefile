@@ -16,14 +16,6 @@ DOCKER_BUILD ?= $(DOCKER) build
 DOCKER_COMPOSE ?= $(DOCKER) compose
 DOCKER_IMAGE_LS ?= $(DOCKER) image ls --format '{{.Repository}}:{{.Tag}}'
 
-package-base:
-	($(DOCKER_IMAGE_LS) | grep -q '$(BASE_IMAGE)$$') \
-		|| $(DOCKER_BUILD) \
-			--build-arg root_image=$(ROOT_IMAGE) \
-			--build-arg certs_image=$(CERTS_IMAGE) \
-			--tag $(BASE_IMAGE) \
-			deployment/docker/base
-
 package-builder:
 	($(DOCKER_IMAGE_LS) | grep -q '$(BUILDER_IMAGE)$$') \
 		|| $(DOCKER_BUILD) \
@@ -60,21 +52,6 @@ app-via-docker-windows: package-builder
 			-ldflags "-s -w -extldflags '-static' $(GO_BUILDINFO)" \
 			-tags 'netgo osusergo' \
 			-o bin/$(APP_NAME)-windows$(APP_SUFFIX)-prod.exe $(PKG_PREFIX)/app/$(APP_NAME)
-
-package-via-docker: package-base
-	($(DOCKER_IMAGE_LS) | grep -q '$(DOCKER_NAMESPACE)/$(APP_NAME):$(PKG_TAG)$(APP_SUFFIX)$(RACE)$$') || (\
-		$(MAKE) app-via-docker && \
-		$(DOCKER_BUILD) \
-			--build-arg src_binary=$(APP_NAME)$(APP_SUFFIX)-prod \
-			--build-arg base_image=$(BASE_IMAGE) \
-			--label "org.opencontainers.image.source=https://github.com/VictoriaMetrics/VictoriaLogs" \
-			--label "org.opencontainers.image.documentation=https://docs.victoriametrics.com/victorialogs/" \
-			--label "org.opencontainers.image.title=$(APP_NAME)" \
-			--label "org.opencontainers.image.vendor=VictoriaMetrics" \
-			--label "org.opencontainers.image.version=$(PKG_TAG)" \
-			--label "org.opencontainers.image.created=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-			--tag $(DOCKER_NAMESPACE)/$(APP_NAME):$(PKG_TAG)$(APP_SUFFIX)$(RACE) \
-			-f app/$(APP_NAME)/deployment/Dockerfile bin)
 
 publish-via-docker:
 	$(MAKE_PARALLEL) app-via-docker-linux-amd64 \
@@ -113,13 +90,6 @@ publish-via-docker-latest:
 	$(foreach registry,$(DOCKER_REGISTRIES),\
 		docker buildx imagetools create --tag $(registry)/$(DOCKER_NAMESPACE)/$(APP_NAME):latest $(registry)/$(DOCKER_NAMESPACE)/$(APP_NAME):$(PKG_TAG); \
 	)
-
-run-via-docker: package-via-docker
-	$(DOCKER_RUN) -it --rm \
-		--user $(shell id -u):$(shell id -g) \
-		--net host \
-		$(DOCKER_OPTS) \
-		$(DOCKER_NAMESPACE)/$(APP_NAME):$(PKG_TAG)$(APP_SUFFIX)$(RACE) $(ARGS)
 
 app-via-docker-goos-goarch:
 	APP_SUFFIX='-$(GOOS)-$(GOARCH)' \
@@ -166,35 +136,6 @@ app-via-docker-windows-amd64:
 	APP_SUFFIX='-amd64' \
 	DOCKER_OPTS='--env CGO_ENABLED=0 --env GOOS=windows --env GOARCH=amd64' \
 	$(MAKE) app-via-docker-windows
-
-package-via-docker-goarch:
-	APP_SUFFIX='-$(GOARCH)' \
-	DOCKER_OPTS='--env CGO_ENABLED=$(CGO_ENABLED) --env GOOS=linux --env GOARCH=$(GOARCH) $(foreach v,$(EXTRA_DOCKER_ENVS),--env $(v))' \
-	$(MAKE) package-via-docker
-
-package-via-docker-pure:
-	APP_SUFFIX='-pure' DOCKER_OPTS='--env CGO_ENABLED=0' $(MAKE) package-via-docker
-
-package-via-docker-amd64:
-	EXTRA_DOCKER_ENVS='CC=x86_64-linux-gnu-gcc' \
-	CGO_ENABLED=1 GOARCH=amd64 $(MAKE) package-via-docker-goarch
-
-package-via-docker-arm64:
-	EXTRA_DOCKER_ENVS='CC=aarch64-linux-gnu-gcc' \
-	CGO_ENABLED=1 GOARCH=arm64 $(MAKE) package-via-docker-goarch
-
-package-via-docker-arm:
-	EXTRA_DOCKER_ENVS='GOARM=5' \
-	CGO_ENABLED=0 GOARCH=arm $(MAKE) package-via-docker-goarch
-
-package-via-docker-ppc64le:
-	CGO_ENABLED=0 GOARCH=ppc64le $(MAKE) package-via-docker-goarch
-
-package-via-docker-s390x:
-	CGO_ENABLED=0 GOARCH=s390x $(MAKE) package-via-docker-goarch
-
-package-via-docker-386:
-	CGO_ENABLED=0 GOARCH=386 $(MAKE) package-via-docker-goarch
 
 remove-docker-images:
 	docker image ls --format '{{.ID}}' | xargs docker image rm -f
