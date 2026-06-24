@@ -133,7 +133,7 @@ services:
   # alertmanager receives alerting notifications from vmalert
   # and distributes them according to --config.file.
   alertmanager:
-    image: prom/alertmanager:v0.30.1
+    image: prom/alertmanager:v0.33.0
     volumes:
       - ./alertmanager.yml:/config/alertmanager.yml
     command:
