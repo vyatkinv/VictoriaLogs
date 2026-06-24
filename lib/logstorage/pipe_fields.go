@@ -20,7 +20,7 @@ func (pf *pipeFields) String() string {
 	if len(pf.fieldFilters) == 0 {
 		logger.Panicf("BUG: pipeFields must contain at least a single field filter")
 	}
-	return "fields " + fieldNamesString(pf.fieldFilters)
+	return "fields " + fieldFiltersString(pf.fieldFilters)
 }
 
 func (pf *pipeFields) splitToRemoteAndLocal(_ int64) (pipe, []pipe) {

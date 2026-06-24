@@ -25,7 +25,7 @@ func (ps *pipeSetStreamFields) String() string {
 	if ps.iff != nil {
 		s += " " + ps.iff.String()
 	}
-	s += " " + fieldNamesString(ps.streamFieldFilters)
+	s += " " + fieldFiltersString(ps.streamFieldFilters)
 	return s
 }
 

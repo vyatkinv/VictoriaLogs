@@ -21,7 +21,7 @@ func (pd *pipeDelete) String() string {
 		logger.Panicf("BUG: pipeDelete must contain at least a single field")
 	}
 
-	return "delete " + fieldNamesString(pd.fieldFilters)
+	return "delete " + fieldFiltersString(pd.fieldFilters)
 }
 
 func (pd *pipeDelete) splitToRemoteAndLocal(_ int64) (pipe, []pipe) {
