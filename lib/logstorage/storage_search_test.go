@@ -1648,6 +1648,16 @@ func TestStorageSearchHiddenFieldsFilters(t *testing.T) {
 	hiddenFieldsFilters = []string{"tenant_id", "ho*"}
 	check(q+" | count() rows", hiddenFieldsFilters, []string{`{"rows":"0"}`})
 
+	// Search the _msg field, which is stored with an empty column name.
+	q = `_msg:"value"`
+	hiddenFieldsFilters = []string{}
+	check(q+" | count() rows", hiddenFieldsFilters, []string{`{"rows":"3500"}`})
+
+	// Search the hidden _msg field
+	q = `_msg:"value"`
+	hiddenFieldsFilters = []string{"_msg"}
+	check(q+" | count() rows", hiddenFieldsFilters, []string{`{"rows":"0"}`})
+
 	s.MustClose()
 
 	fs.MustRemoveDir(path)

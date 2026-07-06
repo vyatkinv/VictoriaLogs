@@ -481,26 +481,25 @@ func TestStorageHiddenFieldsWithFieldNamesPipe(t *testing.T) {
 	PutLogRows(lr)
 	s.DebugFlush()
 
-	// secret_field is visible in field_names without hidden_fields_filters
-	checkQueryResults(t, s, ts, tenantIDs,
-		`* | field_names | filter name:="secret_field" | stats count(*) as c`,
-		nil,
-		[]string{`{"c":"1"}`},
-	)
+	check := func(qStr string, hidden, resultsExpected []string) {
+		t.Helper()
+		checkQueryResults(t, s, ts, tenantIDs, qStr, hidden, resultsExpected)
+	}
 
-	// secret_field must be hidden from field_names when listed in hidden_fields_filters
-	checkQueryResults(t, s, ts, tenantIDs,
-		`* | field_names | filter name:="secret_field" | stats count(*) as c`,
-		[]string{"secret_field"},
-		[]string{`{"c":"0"}`},
-	)
+	// Fast path: field_names is the first pipe.
+	// A field is exposed only when it isn't listed in hidden_fields_filters.
+	check(`* | field_names | filter name:="secret_field" | stats count(*) as c`, nil, []string{`{"c":"1"}`})
+	check(`* | field_names | filter name:="secret_field" | stats count(*) as c`, []string{"secret_field"}, []string{`{"c":"0"}`})
+	// _msg is stored with an empty column name, so it must be hidden as well.
+	check(`* | field_names | filter name:="_msg" | stats count(*) as c`, nil, []string{`{"c":"1"}`})
+	check(`* | field_names | filter name:="_msg" | stats count(*) as c`, []string{"_msg"}, []string{`{"c":"0"}`})
 
-	// same check via the slow path (field_names is not the first pipe)
-	checkQueryResults(t, s, ts, tenantIDs,
-		`* | head 1000 | field_names | filter name:="secret_field" | stats count(*) as c`,
-		[]string{"secret_field"},
-		[]string{`{"c":"0"}`},
-	)
+	// Slow path: field_names is not the first pipe.
+	check(`* | head 1000 | field_names | filter name:="secret_field" | stats count(*) as c`, nil, []string{`{"c":"1"}`})
+	check(`* | head 1000 | field_names | filter name:="secret_field" | stats count(*) as c`, []string{"secret_field"}, []string{`{"c":"0"}`})
+	// _msg is stored with an empty column name, so it must be hidden as well.
+	check(`* | head 1000 | field_names | filter name:="_msg" | stats count(*) as c`, nil, []string{`{"c":"1"}`})
+	check(`* | head 1000 | field_names | filter name:="_msg" | stats count(*) as c`, []string{"_msg"}, []string{`{"c":"0"}`})
 
 	s.MustClose()
 	fs.MustRemoveDir(path)
