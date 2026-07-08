@@ -13,6 +13,7 @@
 5. [Защита отдельных эндпоинтов через authKey](#5-защита-отдельных-эндпоинтов-через-authkey)
 6. [Мультитенантность](#6-мультитенантность)
 7. [Изоляция ролей в кластере](#7-изоляция-ролей-в-кластере)
+15. [Управление TLS через HashiCorp Vault PKI](#15-управление-tls-через-hashicorp-vault-pki)
 8. [Защита от перегрузок (ресурсные лимиты)](#8-защита-от-перегрузок-ресурсные-лимиты)
 9. [Управление секретами](#9-управление-секретами)
 10. [HTTP-заголовки безопасности](#10-http-заголовки-безопасности)
@@ -574,3 +575,236 @@ vlagent отправляет данные на VictoriaLogs через `-remoteW
 | `-envflag.enable` | Разрешить читать флаги из env-переменных |
 | `-envflag.prefix` | Префикс для env-переменных |
 | `-secret.flags` | Список флагов для маскировки в логах |
+
+---
+
+## 15. Управление TLS через HashiCorp Vault PKI
+
+VictoriaLogs поддерживает получение TLS-сертификатов напрямую из [Vault PKI Secrets Engine](https://developer.hashicorp.com/vault/docs/secrets/pki) с автоматическим горячим обновлением без перезапуска процесса.
+
+### Зачем это нужно
+
+При использовании файловых сертификатов (`-tlsCertFile / -tlsKeyFile`) жизненный цикл управляется вручную: нужно своевременно перевыпускать файлы и следить за ротацией. Vault PKI решает это централизованно:
+
+- короткоживущие сертификаты (минуты/часы) без ручного вмешательства;
+- единый источник PKI для всех сервисов;
+- отзыв (revocation) через CRL/OCSP;
+- аудит каждого выпуска.
+
+### Архитектура реализации
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│ victoria-logs                                                      │
+│                                                                    │
+│  main()                                                            │
+│    │                                                               │
+│    ├─ initVaultTLS()          [app/victoria-logs/vault_tls.go]     │
+│    │    │                                                          │
+│    │    ├─ vaulttls.NewProvider(cfg)  [lib/vaulttls/vaulttls.go]   │
+│    │    │    ├─ renew()  ──────────────────────────────────────────┼──► POST /v1/pki/issue/role
+│    │    │    │    └─ tls.X509KeyPair(cert, key)                   │    Vault HTTP API
+│    │    │    └─ go backgroundRenewer()                             │
+│    │    │         └─ sleep until expiry − (lifetime/3)             │
+│    │    │              └─ renew() ─────────────────────────────────┼──► POST /v1/pki/issue/role
+│    │    │                                                          │
+│    │    └─ netutil.SetGlobalCertProvider(provider.GetCertificate)  │
+│    │         [vendor/.../lib/netutil/tls.go]                      │
+│    │                                                               │
+│    └─ httpserver.Serve()                                           │
+│         └─ netutil.GetServerTLSConfig(...)                        │
+│              └─ если globalCertProvider != nil:                    │
+│                   cfg.GetCertificate = globalCertProvider          │
+│                   (файлы не читаются)                              │
+│                                                                    │
+│  tls.ClientHelloInfo → GetCertificate() → возвращает *tls.Certificate │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**Поток данных при каждом TLS-рукопожатии:**
+
+1. Клиент инициирует TLS → Go runtime вызывает `cfg.GetCertificate(hello)`
+2. `Provider.GetCertificate()` проверяет, не наступил ли `renewDeadline`
+3. Если нет — возвращает кэшированный `*tls.Certificate` (lock-free read)
+4. Если да — вызывает `renew()` и возвращает обновлённый сертификат
+
+**Горутина фонового обновления:**
+
+```
+выпуск сертификата (t=0, TTL=24h)
+         │
+         ├─ renewDeadline = expiry − lifetime/3 = t + 16h
+         │
+         └─ backgroundRenewer спит до t+16h
+                   │
+                   ├─ renew() → новый сертификат
+                   └─ следующий цикл: спит до (t+16h)+16h ...
+```
+
+`renewDeadline` вычисляется от `issuedAt` (момент выпуска), а не от `time.Until(expiry)`. Это критично: если бы мы использовали оставшееся время, дедлайн бы уменьшался быстрее реального хода времени и горутина никогда не срабатывала бы вовремя.
+
+**Хуковая точка в netutil:**
+
+```go
+// vendor/.../lib/netutil/tls.go
+
+var globalCertProvider func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+
+func SetGlobalCertProvider(p func(*tls.ClientHelloInfo) (*tls.Certificate, error)) {
+    globalCertProvider = p
+}
+
+func GetServerTLSConfig(...) (*tls.Config, error) {
+    if globalCertProvider == nil {
+        _, err := tls.LoadX509KeyPair(certFile, keyFile) // стандартный путь
+        ...
+    }
+    cfg.GetCertificate = globalCertProvider // или newGetCertificateFunc(файлы)
+    return cfg, nil
+}
+```
+
+Один глобальный провайдер покрывает оба TLS-слушателя (HTTP и syslog TCP), поскольку оба вызывают `netutil.GetServerTLSConfig`.
+
+### Быстрый старт
+
+**Шаг 1: подготовить Vault PKI**
+
+```bash
+# Включить PKI-движок
+vault secrets enable pki
+vault secrets tune -max-lease-ttl=8760h pki
+
+# Создать корневой CA
+vault write pki/root/generate/internal \
+    common_name="My CA" ttl=8760h
+
+# Настроить URL'ы (для CRL)
+vault write pki/config/urls \
+    issuing_certificates="https://vault:8200/v1/pki/ca" \
+    crl_distribution_points="https://vault:8200/v1/pki/crl"
+
+# Создать роль для VictoriaLogs
+vault write pki/roles/victoria-logs \
+    allowed_domains="victorialogs.example.com,localhost" \
+    allow_bare_domains=true \
+    allow_subdomains=true \
+    allow_ip_sans=true \
+    max_ttl=72h \
+    key_type=ec \
+    key_bits=256
+```
+
+**Шаг 2: выдать токен с минимальными правами**
+
+```hcl
+# vault-policy-victorialogs.hcl
+path "pki/issue/victoria-logs" {
+  capabilities = ["update"]
+}
+```
+
+```bash
+vault policy write victoria-logs vault-policy-victorialogs.hcl
+
+vault token create \
+    -policy=victoria-logs \
+    -period=768h \          # периодически обновлять токен через token-файл
+    -display-name=victorialogs
+```
+
+**Шаг 3: запустить VictoriaLogs**
+
+```bash
+victoria-logs \
+  -httpListenAddr=:9428 \
+  -tls=true \
+  -tls.vaultAddr=https://vault.example.com:8200 \
+  -tls.vaultTokenFile=/run/secrets/vault-token \
+  -tls.vaultPKIPath=pki \
+  -tls.vaultRole=victoria-logs \
+  -tls.vaultCommonName=victorialogs.example.com \
+  -tls.vaultAltNames=localhost,127.0.0.1 \
+  -tls.vaultTTL=24h
+```
+
+При старте в логах появится:
+
+```
+initialising Vault PKI TLS provider: addr=https://vault.example.com:8200, ...
+vaulttls: issued certificate for CN="victorialogs.example.com", expires 2026-07-09T12:00:00Z (in 24h0m0s)
+Vault PKI TLS provider ready; certificate expires at 2026-07-09T12:00:00Z
+started server at https://0.0.0.0:9428/
+```
+
+Через 16 ч фоновая горутина выпишет новый сертификат без перезапуска:
+
+```
+vaulttls: issued certificate for CN="victorialogs.example.com", expires 2026-07-10T04:00:00Z (in 24h0m0s)
+```
+
+### Тест горячей замены (локальный)
+
+Поднимает Vault в dev-режиме и VictoriaLogs с TTL=2m. Обновление происходит на ~80-й секунде:
+
+```bash
+# Запуск стека
+docker compose -f docker-compose.vault.yml up -d --build
+
+# E2E тест (занимает ~100 с)
+./scripts/test-vault-tls.sh
+```
+
+Ожидаемый вывод теста:
+
+```
+=== 2. Check initial TLS certificate ===
+notAfter=Jul  8 05:23:43 2026 GMT
+
+=== 6. Verify certificate was renewed (new notAfter) ===
+notAfter=Jul  8 05:25:03 2026 GMT
+PASS: certificate was renewed successfully.
+```
+
+### Справочник флагов
+
+| Флаг | По умолчанию | Описание |
+|------|-------------|----------|
+| `-tls.vaultAddr` | `""` | Адрес Vault, напр. `https://vault:8200`. Vault-режим активируется только когда флаг задан. |
+| `-tls.vaultToken` | `""` | Статический токен. Поддерживает `file:///path` и `https://url` через механизм `Password`. |
+| `-tls.vaultTokenFile` | `""` | Путь к файлу с токеном. Перечитывается при каждом обновлении — поддерживает ротацию токена. |
+| `-tls.vaultPKIPath` | `pki` | Mount path PKI-движка в Vault. |
+| `-tls.vaultRole` | `""` | Имя PKI-роли для выпуска сертификатов. |
+| `-tls.vaultCommonName` | `""` | CN сертификата. |
+| `-tls.vaultAltNames` | `""` | Дополнительные SAN через запятую (DNS и IP). |
+| `-tls.vaultTTL` | `24h` | Запрашиваемый TTL. Vault применит `max_ttl` из роли если запрошено больше. |
+| `-tls.vaultRenewBefore` | `0` | Насколько до истечения обновлять. По умолчанию `TTL/3`. |
+
+### Приоритет провайдеров
+
+```
+-tls.vaultAddr задан?
+    ДА  → Vault PKI (файловые флаги -tlsCertFile/-tlsKeyFile игнорируются)
+    НЕТ → файловые сертификаты (существующее поведение, горячая замена каждые 1 с)
+```
+
+### Ротация токена Vault
+
+Если Vault-токен истечёт — обновление сертификата завершится ошибкой, но текущий сертификат будет раздаваться до истечения срока:
+
+```
+vaulttls: background renewal failed: vault returned HTTP 403: ...; will retry in 10s
+```
+
+Для zero-downtime ротации токена:
+1. Выпустить новый токен
+2. Записать в файл `-tls.vaultTokenFile`
+3. Следующий `renew()` подхватит его автоматически (файл перечитывается при каждом обращении)
+
+### Безопасность
+
+- **Токен в памяти:** значение `-tls.vaultToken` маскируется в логах (тип `flagutil.Password` всегда выводит `"secret"`).
+- **mTLS до Vault:** если Vault сам за mTLS, передайте CA через системный пул (`ca-certificates`) внутри контейнера; кастомный TLS-клиент в `Provider` пока не реализован.
+- **Нет at-rest шифрования ключа:** приватный ключ живёт в памяти процесса. Защита на уровне OS — `mlock` или seccomp, если требуется.
+- **Аудит:** каждый вызов `POST /v1/pki/issue/role` фиксируется в Vault audit log с меткой токена `victoria-logs`.
+
