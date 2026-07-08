@@ -16,6 +16,7 @@
 8. [Ключевые алгоритмы и подходы](#8-ключевые-алгоритмы-и-подходы)
 9. [Кластерный режим](#9-кластерный-режим)
 10. [Паттерны управления памятью](#10-паттерны-управления-памятью)
+11. [Бинарный формат файлов в Part](#11-бинарный-формат-файлов-в-part)
 
 ---
 
@@ -534,6 +535,279 @@ shard.data = append(shard.data, ...)
 ### `chunkedAllocator` (`chunked_allocator.go`)
 
 Используется в пайпах, которым нужно хранить строки между вызовами `writeBlock` (например, `pipe_uniq`, `pipe_sort`). Аллоцирует большие чанки и нарезает строки из них — снижает давление на GC при большом числе уникальных строк.
+
+---
+
+## 11. Бинарный формат файлов в Part
+
+Каждая «часть» (part) на диске — это директория `<uuid>/` с набором бинарных файлов. Исходный код: `lib/logstorage/filenames.go`, `block_header.go`, `column_names.go`, `bloomfilter.go`, `encoding.go`.
+
+### Обзор файлов
+
+```
+<uuid>/
+  metadata.json              ← статистика части (JSON)
+  column_names.bin           ← словарь имён колонок (zstd)
+  column_idxs.bin            ← маппинг колонка → шард values/bloom (raw)
+  metaindex.bin              ← верхний уровень индекса (zstd)
+  index.bin                  ← заголовки блоков (zstd-блоки)
+  columns_header_index.bin   ← быстрый поиск колонки в block (raw)
+  columns_header.bin         ← метаданные колонок блока (raw)
+  timestamps.bin             ← временны́е метки (delta/delta-of-delta/const)
+  message_values.bin         ← значения поля _msg
+  message_bloom.bin          ← bloom-фильтр для _msg
+  values.bin0 .. values.bin127   ← значения остальных колонок (0..127 шардов)
+  bloom.bin0  .. bloom.bin127    ← bloom-фильтры остальных колонок (шарды)
+```
+
+Максимальное число шардов для values/bloom: **128** (`bloomValuesMaxShardsCount`). Реальное число шардов в конкретной части хранится в `metadata.json` поле `BloomValuesShardsCount`.
+
+---
+
+### `metadata.json`
+
+Сериализованный `partHeader`. Читается при открытии части:
+
+```json
+{
+  "FormatVersion": 3,
+  "UncompressedSizeBytes": 1048576,
+  "RowsCount": 50000,
+  "BlocksCount": 12,
+  "MinTimestamp": 1720000000000000000,
+  "MaxTimestamp": 1720003600000000000,
+  "BloomValuesShardsCount": 4
+}
+```
+
+`FormatVersion` = 3 — текущая последняя версия. При изменении числа шардов версия обновляется.
+
+---
+
+### `column_names.bin`
+
+Глобальный словарь имён колонок для данной части. Один файл на всю часть (не на блок).
+
+**Формат** (zstd-сжатый блок):
+```
+[count: varint]
+  [name_0_len: varint][name_0: bytes]
+  [name_1_len: varint][name_1: bytes]
+  ...
+```
+
+ID колонки = порядковый индекс (0, 1, 2, ...). Используется везде, где нужно ссылаться на имя колонки — в `column_idxs.bin`, `columns_header_index.bin` и в `columnsHeader`. Читается один раз при открытии части и кешируется в `p.columnNames []string`.
+
+---
+
+### `column_idxs.bin`
+
+Маппинг ID колонки → номер шарда (в `values.binN` / `bloom.binN`).
+
+**Формат** (raw binary, без сжатия):
+```
+[count: varint]
+  [columnID: varint][shardIdx: varint]
+  [columnID: varint][shardIdx: varint]
+  ...
+```
+
+Шард вычисляется при записи как `nextColumnIdx % 128` — то есть колонки распределяются по шардам round-robin в порядке первого появления. Несколько колонок могут попасть в один шард.
+
+---
+
+### `metaindex.bin`
+
+Верхний уровень двухуровневого индекса. **Один zstd-блок** на весь файл. После распаковки — плоский массив `indexBlockHeader`:
+
+```
+[streamID: 24 bytes][minTimestamp: 8 bytes BE][maxTimestamp: 8 bytes BE]
+[indexBlockOffset: 8 bytes BE][indexBlockSize: 8 bytes BE]
+= 56 bytes per entry
+```
+
+`streamID` = 16 байт xxhash128 от набора stream-лейблов + 8 байт `TenantID{AccountID, ProjectID}`.
+
+Записи **отсортированы по `streamID`**. Это позволяет бинарным поиском найти диапазон `indexBlockHeader`-ов, которые могут содержать нужный стрим, и не читать весь `index.bin`.
+
+---
+
+### `index.bin`
+
+Содержит `blockHeader`-ы, сгруппированные в «индексные блоки». Каждый индексный блок — отдельный zstd-сжатый фрагмент файла размером до **128 КБ** распакованных данных (`maxUncompressedIndexBlockSize`). Смещение и размер каждого фрагмента хранятся в соответствующем `indexBlockHeader` из `metaindex.bin`.
+
+**Структура одного `blockHeader`** (в распакованном виде):
+```
+streamID                         (24 bytes)
+uncompressedSizeBytes            (varint)
+rowsCount                        (varint)
+timestampsHeader:
+  blockOffset                    (8 bytes BE)
+  blockSize                      (8 bytes BE)
+  minTimestamp                   (8 bytes BE, nanoseconds)
+  maxTimestamp                   (8 bytes BE, nanoseconds)
+  marshalType                    (1 byte)
+columnsHeaderIndexOffset         (varint)
+columnsHeaderIndexSize           (varint)
+columnsHeaderOffset              (varint)
+columnsHeaderSize                (varint)
+```
+
+Все `blockHeader`-ы в индексном блоке **отсортированы по (streamID, minTimestamp)**. При поиске движок итерирует по ним и пропускает те, чей `minTimestamp..maxTimestamp` не пересекается с запрошенным диапазоном.
+
+---
+
+### `columns_header_index.bin`
+
+Позволяет найти метаданные конкретной колонки внутри `columns_header.bin` по её ID без десериализации всего `columnsHeader`. Хранится как поток байт; смещение и размер для каждого блока берутся из `blockHeader.columnsHeaderIndexOffset/Size`.
+
+**Формат** (raw, не сжат):
+```
+[count of columnHeadersRefs: varint]
+  [columnNameID: varint][offset_in_columnsHeader: varint]
+  ...
+[count of constColumnsRefs: varint]
+  [columnNameID: varint][offset_in_columnsHeader: varint]
+  ...
+```
+
+Разделение на `columnHeadersRefs` (переменные колонки) и `constColumnsRefs` (константные колонки) позволяет при чтении сразу знать тип, не читая сами данные.
+
+---
+
+### `columns_header.bin`
+
+Метаданные колонок для каждого блока. Смещение и размер для каждого блока берутся из `blockHeader.columnsHeaderOffset/Size`. **Не сжат** — данные небольшие, а доступ происходит по случайному смещению.
+
+**Формат одного `columnsHeader`**:
+```
+[count of variable columnHeaders: varint]
+  for each columnHeader:
+    [valueType: 1 byte]
+    [type-specific fields (см. ниже)]
+[count of constColumns: varint]
+  for each constColumn:
+    [value_len: varint][value: bytes]
+    # имя колонки — через constColumnsRefs[i].columnNameID → columnNames[id]
+```
+
+**Поля `columnHeader` в зависимости от `valueType`:**
+
+| valueType | Byte | Дополнительные поля | Примечание |
+|-----------|------|---------------------|------------|
+| `string`  | 1    | valuesOffset(v) + valuesSize(v) + bloomOffset(v) + bloomSize(v) | строки as-is, zstd если > 128 байт |
+| `dict`    | 2    | valuesDict[count(1) + ≤8 строк] + valuesOffset(v) + valuesSize(v) | без bloom, dict хранится прямо в header |
+| `uint8`   | 3    | min(1) + max(1) + valuesOffset(v) + valuesSize(v) + bloomOffset(v) + bloomSize(v) | 1 байт/строка |
+| `uint16`  | 4    | min(2 BE) + max(2 BE) + ... | 2 байта/строка |
+| `uint32`  | 5    | min(4 BE) + max(4 BE) + ... | 4 байта/строка |
+| `uint64`  | 6    | min(8 BE) + max(8 BE) + ... | 8 байт/строка |
+| `int64`   | 10   | min(8 BE signed) + max(8 BE signed) + ... | 8 байт/строка |
+| `float64` | 7    | min(8 BE, math.Float64bits) + max(8 BE) + ... | IEEE 754 → uint64 |
+| `ipv4`    | 8    | min(4 BE) + max(4 BE) + ... | uint32 big-endian |
+| `iso8601` | 9    | min(8 BE, ns) + max(8 BE, ns) + ... | int64 nanoseconds |
+
+`(v)` = varint (1–9 байт, little-endian 7-bit encoding).
+
+`minValue`/`maxValue` позволяют пропустить блок при числовом range-запросе (`field:>100`), не читая значения из файла.
+
+**Константная колонка** (`constColumn`) — колонка, у которой все строки в блоке имеют одно и то же значение. Значение хранится один раз в `columns_header.bin`. Имя — через `constColumnsRefs` → `columnNames`.
+
+---
+
+### `timestamps.bin`
+
+Блоки временны́х меток, хранятся последовательно. Каждый блок соответствует одному `blockHeader`, его позиция определяется `timestampsHeader.blockOffset/blockSize`.
+
+**Тип кодирования** (`timestampsHeader.marshalType`, 1 байт):
+
+| Тип | Значение | Описание |
+|-----|----------|----------|
+| `MarshalTypeConst` | 3 | Все метки одинаковые — хранится только одно значение |
+| `MarshalTypeDeltaConst` | 2 | Константный шаг между метками (e.g., каждые 1ms) |
+| `MarshalTypeNearestDelta2` | 5 | Delta-of-delta (Горилла-стиль), без zstd |
+| `MarshalTypeZSTDNearestDelta2` | 1 | Delta-of-delta + zstd |
+| `MarshalTypeNearestDelta` | 6 | Простое дельта-кодирование, без zstd |
+| `MarshalTypeZSTDNearestDelta` | 4 | Дельта + zstd |
+
+При записи движок пробует все типы и выбирает результат наименьшего размера. Временны́е метки хранятся в **наносекундах** с Unix-эпохи.
+
+---
+
+### `message_values.bin` и `values.bin{N}`
+
+Блоки значений колонок. `message_values.bin` — для поля `_msg` (пустое имя колонки). `values.bin{N}` — для остальных колонок (шард N).
+
+Каждый блок значений — это `marshalBytesBlock`:
+```
+[type: 1 byte]
+  0x00 = plain: [len: 1 byte][data: len bytes]   # если < 128 байт
+  0x01 = zstd:  [compressed_len: varint][zstd(data)]
+```
+
+Внутри данных — в зависимости от `valueType` колонки:
+
+| valueType | Байт на строку | Формат внутри блока |
+|-----------|---------------|---------------------|
+| `string`  | переменный    | `marshalUint64Block(lengths)` + конкатенация строк |
+| `dict`    | 1             | N байт (индекс в `valuesDict` из `columnHeader`) |
+| `uint8`   | 1             | N байт as-is |
+| `uint16`  | 2             | N × 2 байт (big-endian) |
+| `uint32`  | 4             | N × 4 байт (big-endian) |
+| `uint64`  | 8             | N × 8 байт (big-endian) |
+| `int64`   | 8             | N × 8 байт (big-endian, signed) |
+| `float64` | 8             | N × 8 байт (math.Float64bits, big-endian) |
+| `ipv4`    | 4             | N × 4 байт (big-endian uint32) |
+| `iso8601` | 8             | N × 8 байт (nanosecond int64, big-endian) |
+
+Для `valueTypeString`, длины хранятся через `marshalUint64Block` — адаптивное кодирование uint64-массива:
+```
+[blockType: 1 byte]
+  0 → N × uint8   1 → N × uint16   2 → N × uint32   3 → N × uint64
+  4 → const uint8  5 → const uint16  6 → const uint32  7 → const uint64
+[values: blockType-specific bytes]
+```
+
+Типы `const*` (4–7) экономят место когда все строки имеют одинаковую длину.
+
+---
+
+### `message_bloom.bin` и `bloom.bin{N}`
+
+Bloom-фильтры для блоков. `message_bloom.bin` — для `_msg`, `bloom.bin{N}` — для колонок в шарде N.
+
+**Формат**: плоский массив `uint64`-слов (big-endian), без заголовка. Размер и смещение берутся из `columnHeader.bloomFilterOffset/bloomFilterSize`.
+
+**Алгоритм**:
+- 16 бит на токен (`bloomFilterBitsPerItem = 16`)
+- 6 хеш-функций (`bloomFilterHashesCount = 6`)
+- Для каждого токена из значений:
+  1. `h₀ = xxhash64(token)` — базовый хеш
+  2. `h₁..h₅` = 6 последовательных хешей от 8-байтового представления `h₀` (инкрементируя значение после каждого хеша)
+  3. Каждый `hᵢ % totalBits` → устанавливает один бит в массиве
+- Токены для разных `valueType` разные: для `string` — слова из текста; для `uint*`/`int64`/`float64`/`ipv4`/`iso8601` — hex-представление числового значения
+
+**Пропуск блоков при поиске**: перед чтением значений из `values.bin` движок проверяет bloom-фильтр. Если ни один из токенов запроса не встречается в фильтре — блок пропускается целиком (`I/O saved`).
+
+---
+
+### Схема связей между файлами
+
+```
+metaindex.bin
+  [indexBlockHeader]──offset/size──► index.bin
+                                        [blockHeader]
+                                          timestampsHeader.blockOffset/Size──► timestamps.bin
+                                          columnsHeaderIndexOffset/Size──► columns_header_index.bin
+                                            [columnNameID + offset]──► columns_header.bin
+                                                [columnHeader]
+                                                  valuesOffset/Size──► message_values.bin
+                                                                        values.bin{N}
+                                                  bloomOffset/Size──► message_bloom.bin
+                                                                        bloom.bin{N}
+                                          columnsHeaderOffset/Size──► columns_header.bin
+column_names.bin──[id→name]──► (используется везде, где встречается columnNameID)
+column_idxs.bin──[name→shardN]──► (определяет N для values.binN / bloom.binN)
+```
 
 ---
 
