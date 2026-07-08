@@ -16,7 +16,8 @@
 8. [Ключевые алгоритмы и подходы](#8-ключевые-алгоритмы-и-подходы)
 9. [Кластерный режим](#9-кластерный-режим)
 10. [Паттерны управления памятью](#10-паттерны-управления-памятью)
-11. [Бинарный формат файлов в Part](#11-бинарный-формат-файлов-в-part)
+11. [Что хранится в памяти и как данные попадают на диск](#11-что-хранится-в-памяти-и-как-данные-попадают-на-диск)
+12. [Бинарный формат файлов в Part](#12-бинарный-формат-файлов-в-part)
 
 ---
 
@@ -538,7 +539,236 @@ shard.data = append(shard.data, ...)
 
 ---
 
-## 11. Бинарный формат файлов в Part
+## 11. Что хранится в памяти и как данные попадают на диск
+
+### Уровни буферизации
+
+Путь записи от HTTP-запроса до диска проходит три уровня в памяти:
+
+```
+HTTP handler
+  │
+  ▼
+rowsBuffer.shard.lr   ← уровень 1: сырые строки (pre-buffer)
+  │  flush: ~1 сек или по размеру
+  ▼
+inmemoryPart          ← уровень 2: полностью индексированная часть в RAM
+  │  flush: flushInterval (5 сек по умолчанию) или при shutdown
+  ▼
+smallPart / bigPart   ← уровень 3: файлы на диске
+```
+
+---
+
+### Уровень 1: `rowsBuffer` — pre-buffer сырых строк
+
+**Файл:** `datadb.go`, тип `rowsBuffer`
+
+`datadb.rb` — это шардированный буфер, куда попадают все вызовы `mustAddRows`. Шардов ровно столько, сколько CPU (`cgroup.AvailableCPUs()`). Распределение — round-robin по счётчику `rb.nextIdx`.
+
+Каждый шард (`rowsBufferShard`) содержит:
+- `mu sync.Mutex` — защита шарда
+- `lr *logRows` — текущий буфер сырых строк (поля `streamIDs`, `timestamps`, `rows [][]Field`)
+- `flushTimer *time.Timer` — таймер на 1 секунду, запускаемый при первой записи в шард
+
+**Триггеры сброса шарда:**
+1. `lr.needFlush()` — размер данных в `lr` достиг лимита (вызывается синхронно при каждой записи)
+2. `time.AfterFunc(1 second)` — таймер сработал (асинхронный flush)
+
+При сбросе вызывается `mustFlushLogRows(lr)`:
+1. Сортировка строк по `(streamID, timestamp)` — `sort.Sort(lr)`
+2. Сортировка полей внутри каждой строки
+3. Создание `inmemoryPart` из отсортированных данных
+4. Добавление в `ddb.inmemoryParts`
+
+**Важно:** данные в `rowsBuffer` ещё не поисковые — они не видны при запросах LogsQL до момента преобразования в `inmemoryPart`. Эту задержку отражает метрика `vl_pending_rows{type="storage"}`.
+
+---
+
+### Уровень 2: `inmemoryPart` — индексированная часть в памяти
+
+**Файл:** `inmemory_part.go`, тип `inmemoryPart`
+
+`inmemoryPart` — это полный аналог дисковой части, но хранящийся в `chunkedbuffer.Buffer` вместо файлов. Содержит те же данные, что и файлы на диске:
+
+```go
+type inmemoryPart struct {
+    ph                 partHeader          // метаданные (счётчики, диапазон времён)
+    columnNames        chunkedbuffer.Buffer // = column_names.bin
+    columnIdxs         chunkedbuffer.Buffer // = column_idxs.bin
+    metaindex          chunkedbuffer.Buffer // = metaindex.bin
+    index              chunkedbuffer.Buffer // = index.bin
+    columnsHeaderIndex chunkedbuffer.Buffer // = columns_header_index.bin
+    columnsHeader      chunkedbuffer.Buffer // = columns_header.bin
+    timestamps         chunkedbuffer.Buffer // = timestamps.bin
+    messageBloomValues bloomValuesBuffer   // = message_bloom.bin + message_values.bin
+    fieldBloomValues   bloomValuesBuffer   // = bloom.bin0 + values.bin0 (один шард)
+}
+```
+
+`chunkedbuffer.Buffer` — это буфер с чанками фиксированного размера (не растущий слайс), чтобы не копировать данные при росте. Поиск по `inmemoryPart` работает через те же `blockStreamReader`/`blockSearch`, что и при поиске по файлам.
+
+**Создание `inmemoryPart` из `logRows`:**
+1. Группировка по `streamID`
+2. Нарезка на блоки по `maxUncompressedBlockSize` (2 МБ)
+3. Для каждого блока:
+   - Кодирование временны́х меток (выбор лучшего из 6 типов кодирования)
+   - Определение `valueType` каждой колонки (пробуем dict → uint → int → float → ipv4 → iso8601 → string)
+   - Построение bloom-фильтра для каждой колонки
+   - Запись в соответствующий `chunkedbuffer.Buffer`
+
+**Ограничения на `inmemoryPart`:**
+- Максимальный размер одной части: `getMaxInmemoryPartSize()` = `10% × memory.Allowed() / 20`. При `memory.Allowed()` = 8 ГБ это ≈ 40 МБ на часть.
+- Максимальное число inmemory-частей: `maxInmemoryPartsPerPartition` = 20
+- Дедлайн сброса на диск: `time.Now() + flushInterval` (флаг `-inmemoryDataFlushInterval`, дефолт 5 сек)
+
+**Инварианты на время жизни:**
+- `partWrapper.refCount` — атомарный счётчик ссылок. Увеличивается при старте поиска, уменьшается при его завершении.
+- `partWrapper.isInMerge` — защита от одновременного выбора части двумя merge-горутинами (выставляется под `partsLock`).
+- `partWrapper.mustDrop` — флаг «удалить при обнулении refCount». Выставляется после включения merge-результата в список активных частей.
+
+---
+
+### Уровень 3: файловые части (smallPart / bigPart)
+
+Определение типа назначения результата merge:
+
+```
+dstSize > getMaxSmallPartSize()              → partBig
+isFinal || dstSize > getMaxInmemoryPartSize() → partSmall  
+все источники — inmemory && !isFinal          → partInmemory
+```
+
+`getMaxSmallPartSize()` = `min(memory.Remaining() / 15, available_disk_space)`. Это значит: small parts должны помещаться в page cache (примерно).
+
+**Отличие bigPart от smallPart:**
+- `bigPart` записывается с `nocache=true` — `O_DIRECT` флаг, данные обходят page cache при записи. Это позволяет не вытеснять hot-данные small-частей из кеша ядра.
+- `smallPart` записывается обычно — попадает в page cache и доступен без I/O при следующем чтении.
+
+---
+
+### Flush inmemoryParts → диск
+
+**Файл:** `datadb.go:mustFlushInmemoryPartsToFiles()`
+
+Фоновая горутина `inmemoryPartsFlusher` тикает каждые `flushInterval` (5 сек) и вызывает `mustFlushInmemoryPartsToFiles(false)`. Она смотрит на `pw.flushDeadline` каждой inmemory-части и сбрасывает на диск те, чей дедлайн прошёл.
+
+**Быстрый путь** (одна часть, без merge): `mp.MustStoreToDisk(path)` — параллельная запись всех `chunkedbuffer.Buffer`-ов в файлы через `filestream.ParallelStreamWriter`.
+
+**Медленный путь** (несколько частей): запускается K-way merge через `mustMergeBlockStreams()`.
+
+**При graceful shutdown** (SIGTERM, `mustCloseDatadb()`):
+1. `rb.flush()` — сбросить все шарды `rowsBuffer` в `inmemoryPart`
+2. `close(stopCh)` → все merge-горутины останавливаются
+3. `ddb.wg.Wait()` — дождаться завершения текущих merge
+4. `mustFlushInmemoryPartsToFiles(true)` — сбросить ВСЕ inmemory-части, игнорируя `flushDeadline` и `stopCh`
+
+---
+
+### Merge: алгоритм выбора частей
+
+**Файл:** `datadb.go:appendPartsToMerge()`
+
+Merge не запускается просто «когда частей стало много». Реализован жадный алгоритм минимизации write amplification:
+
+1. **Фильтрация:** отбросить части > `maxOutBytes / minMergeMultiplier` (1.7) — они слишком большие, их merge только навредит write amplification.
+
+2. **Сортировка** оставшихся по размеру (по возрастанию), при равном — по убыванию временно́й метки. Это улучшает локальность данных в результирующей части.
+
+3. **Exhaustive search** по всем contiguous subsets размером от `ceil(defaultPartsToMerge/2)` до `defaultPartsToMerge` (= от 8 до 15):
+   - Пропускаем если `parts[0].size * count < parts[last].size` — слишком несбалансированно
+   - Пропускаем если общий выход > `maxOutBytes`
+   - Считаем «коэффициент слияния» `m = outSize / maxInputPartSize`
+   - Запоминаем subset с максимальным `m`
+
+4. **Порог:** если лучшее `m < minMergeMultiplier` (1.7) — merge отменяется. Нет смысла мержить, если не достигается хотя бы 1.7× роста относительно самой большой входной части.
+
+**Параллелизм merge:** три независимых канальных семафора (каждый с capacity = `AvailableCPUs()`):
+- `inmemoryPartsConcurrencyCh` — для inmemory→inmemory и inmemory→disk
+- `smallPartsConcurrencyCh` — для small→small и small→big
+- `bigPartsConcurrencyCh` — для big→big
+
+---
+
+### Merge: исполнение
+
+**Файл:** `datadb.go:mustMergePartsInternal()`
+
+```
+1. Проверить/зарезервировать место на диске (reservedDiskSpace atomic)
+2. Открыть blockStreamReader для каждой исходной части
+3. Открыть blockStreamWriter для результата:
+   - inmemory: инициализируется из нового inmemoryPart
+   - файл: path = <datadb.path>/<mergeIdx:016X>/
+4. mustMergeBlockStreams() — потоковый K-way merge:
+   - Читает blockHeader из всех источников
+   - Объединяет в порядке (streamID, minTimestamp)
+   - Применяет dropFilter если задан (для удаления логов)
+   - Пишет результат через blockStreamWriter
+5. Записать metadata.json, sync директории
+6. swapSrcWithDstParts() — под partsLock:
+   a. Добавить новую часть в нужный список
+   b. Записать обновлённый parts.json (атомарно — через temp file + rename)
+   c. Убрать старые части из списка
+   d. Выставить pw.mustDrop = true на старых частях
+   e. decRef() — если refCount == 0, удалить директорию
+```
+
+**Атомарность `parts.json`:** `fs.MustWriteAtomic` пишет в temp-файл, затем делает rename. Это гарантирует: при сбое видим либо старый, либо новый список — никогда половинчатый.
+
+---
+
+### Что теряется при сбое
+
+| Слой | Что содержит | Теряется при сбое |
+|------|-------------|-------------------|
+| `rowsBuffer.shard.lr` | Последние ≤1 сек данных | **Да** |
+| `inmemoryPart` (до flush) | Данные за ≤5 сек | **Да** |
+| Файл в процессе merge | Incomplete directory не в parts.json | Нет (очищается при запуске) |
+| `smallPart` / `bigPart` | Данные с подтверждённым parts.json | **Нет** |
+
+При открытии `datadb` вызывается `mustRemoveUnusedDirs()` — он удаляет все поддиректории, которых нет в `parts.json`. Так убираются «осиротевшие» директории от прерванных merge.
+
+Уменьшить потенциальную потерю данных можно флагом `-inmemoryDataFlushInterval` (например, `1s`), но это увеличивает нагрузку на диск.
+
+---
+
+### Схема жизненного цикла части
+
+```
+[ingestion goroutine]
+  MustAddRows(lr)
+    └─ rb.shard[cpu].lr ← append rows
+         │
+         ├── [timer 1s / needFlush()] mustFlushLogRows(lr)
+         │     └─ sort + encode → inmemoryPart (in RAM, in ddb.inmemoryParts)
+         │
+         └── [timer 5s / shutdown] mustFlushInmemoryPartsToFiles()
+               ├── fast path (1 part): MustStoreToDisk() → smallPart
+               └── slow path (N parts): mustMergeBlockStreams() → smallPart/bigPart
+
+[background merger goroutines × AvailableCPUs each type]
+  inmemoryPartsMerger:
+    └─ inmemory + inmemory → inmemory (если результат < maxInmemoryPartSize)
+    └─ inmemory + inmemory → smallPart (если результат больше или isFinal)
+  smallPartsMerger:
+    └─ small × [8..15] → smallPart / bigPart
+  bigPartsMerger:
+    └─ big × [8..15] → bigPart
+
+[при достижении retention]
+  storage.runRetentionWatcher()
+    └─ удаляет целые партиции (папки по дням) у которых MaxTimestamp < now-retention
+
+[при запросе на удаление]
+  deleteRows(dropFilter)
+    └─ находит части с совпадающими строками
+    └─ mustMergePartsInternal(..., dropFilter) — merge с выбрасыванием совпадений
+```
+
+---
+
+## 12. Бинарный формат файлов в Part
 
 Каждая «часть» (part) на диске — это директория `<uuid>/` с набором бинарных файлов. Исходный код: `lib/logstorage/filenames.go`, `block_header.go`, `column_names.go`, `bloomfilter.go`, `encoding.go`.
 
