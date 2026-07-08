@@ -10,11 +10,26 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 )
 
+// globalCertProvider, when non-nil, overrides file-based certificate loading
+// in GetServerTLSConfig. Register before calling httpserver.Serve.
+var globalCertProvider func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+
+// SetGlobalCertProvider registers a GetCertificate callback that takes precedence
+// over the -tlsCertFile / -tlsKeyFile flags. Intended for Vault PKI integration.
+// Must be called before any TLS listener is created.
+func SetGlobalCertProvider(p func(*tls.ClientHelloInfo) (*tls.Certificate, error)) {
+	globalCertProvider = p
+}
+
 // GetServerTLSConfig returns TLS config for the server.
+// When a global cert provider has been registered via SetGlobalCertProvider,
+// the provider is used instead of loading certificates from tlsCertFile/tlsKeyFile.
 func GetServerTLSConfig(tlsCertFile, tlsKeyFile, tlsMinVersion string, tlsCipherSuites []string) (*tls.Config, error) {
-	_, err := tls.LoadX509KeyPair(tlsCertFile, tlsKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("cannot load TLS certificate and key files: %w", err)
+	if globalCertProvider == nil {
+		_, err := tls.LoadX509KeyPair(tlsCertFile, tlsKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("cannot load TLS certificate and key files: %w", err)
+		}
 	}
 
 	minVersion, err := ParseTLSVersion(tlsMinVersion)
@@ -34,7 +49,11 @@ func GetServerTLSConfig(tlsCertFile, tlsKeyFile, tlsMinVersion string, tlsCipher
 		CipherSuites: cipherSuites,
 	}
 
-	cfg.GetCertificate = newGetCertificateFunc(tlsCertFile, tlsKeyFile)
+	if globalCertProvider != nil {
+		cfg.GetCertificate = globalCertProvider
+	} else {
+		cfg.GetCertificate = newGetCertificateFunc(tlsCertFile, tlsKeyFile)
+	}
 	return cfg, nil
 }
 

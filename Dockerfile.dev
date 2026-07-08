@@ -1,0 +1,16 @@
+FROM golang:bookworm AS builder
+WORKDIR /build
+COPY go.mod go.sum ./
+COPY vendor/ vendor/
+COPY . .
+RUN CGO_ENABLED=1 go build -mod=vendor \
+    -ldflags "-s -w" \
+    -o bin/victoria-logs \
+    ./app/victoria-logs/
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/bin/victoria-logs /usr/local/bin/victoria-logs
+ENTRYPOINT ["victoria-logs"]

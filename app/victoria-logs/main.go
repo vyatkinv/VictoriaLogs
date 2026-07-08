@@ -49,6 +49,8 @@ func main() {
 	insertutil.SetLogRowsStorage(&vlstorage.Storage{})
 	vlinsert.Init()
 
+	initVaultTLS()
+
 	go httpserver.Serve(listenAddrs, requestHandler, httpserver.ServeOptions{
 		UseProxyProtocol: useProxyProtocol,
 	})
@@ -69,6 +71,7 @@ func main() {
 	vlinsert.Stop()
 	vlselect.Stop()
 	vlstorage.Stop()
+	stopVaultTLS()
 
 	logger.Infof("the VictoriaLogs has been stopped in %.3f seconds", time.Since(startTime).Seconds())
 }

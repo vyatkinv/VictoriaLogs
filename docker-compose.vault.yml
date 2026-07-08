@@ -1,0 +1,57 @@
+services:
+  vault:
+    image: hashicorp/vault:1.17
+    hostname: vault
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    ports:
+      - "8200:8200"
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "sh", "-c", "VAULT_ADDR=http://127.0.0.1:8200 vault status"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 2s
+
+  vault-setup:
+    image: hashicorp/vault:1.17
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: root
+    volumes:
+      - ./scripts/vault-pki-setup.sh:/setup.sh:ro
+    entrypoint: ["/bin/sh", "/setup.sh"]
+
+  victoria-logs:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    depends_on:
+      vault-setup:
+        condition: service_completed_successfully
+    ports:
+      - "9428:9428"
+    # Certificate TTL is intentionally short (2m) to allow observing hot reload.
+    # At ~80 s after startup the background renewer will issue a fresh certificate.
+    command:
+      - -httpListenAddr=:9428
+      - -tls=true
+      - -tls.vaultAddr=http://vault:8200
+      - -tls.vaultToken=root
+      - -tls.vaultPKIPath=pki
+      - -tls.vaultRole=victoria-logs
+      - -tls.vaultCommonName=localhost
+      - -tls.vaultTTL=2m
+      - -storageDataPath=/tmp/vldata
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -qO- --no-check-certificate https://localhost:9428/health | grep -q OK"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
