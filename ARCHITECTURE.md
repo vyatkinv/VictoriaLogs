@@ -1041,6 +1041,141 @@ column_idxs.bin──[name→shardN]──► (определяет N для val
 
 ---
 
+## 13. Vault PKI TLS: архитектура интеграции
+
+Позволяет получать TLS-сертификаты для HTTP и syslog-слушателей напрямую из HashiCorp Vault PKI Secrets Engine вместо файлов на диске. Реализует автоматическую горячую замену без перезапуска процесса.
+
+### Файлы
+
+| Файл | Роль |
+|------|------|
+| `lib/vaulttls/vaulttls.go` | Vault PKI-клиент: выпуск, кэширование, фоновое обновление |
+| `app/victoria-logs/vault_tls.go` | CLI-флаги; вызывает `initVaultTLS()` до старта HTTP-сервера |
+| `vendor/.../lib/netutil/tls.go` | Хуковая точка: `SetGlobalCertProvider()` + проверка в `GetServerTLSConfig` |
+
+### Поток управления при старте
+
+```
+main()
+ ├─ envflag.Parse()
+ ├─ vlstorage.Init()
+ ├─ initVaultTLS()                        ← app/victoria-logs/vault_tls.go
+ │    ├─ vaulttls.NewProvider(cfg)        ← lib/vaulttls/vaulttls.go
+ │    │    ├─ renew()  ───────────────────────► POST /v1/{pki}/issue/{role}
+ │    │    │    └─ tls.X509KeyPair(cert, key)   Vault HTTP API
+ │    │    └─ go backgroundRenewer()
+ │    └─ netutil.SetGlobalCertProvider(provider.GetCertificate)
+ └─ go httpserver.Serve()
+       └─ netutil.GetServerTLSConfig("", "", ...)
+            └─ globalCertProvider != nil → cfg.GetCertificate = globalCertProvider
+```
+
+### Хук в netutil
+
+До интеграции `GetServerTLSConfig` всегда загружал пару с диска:
+
+```go
+func GetServerTLSConfig(certFile, keyFile, ...) (*tls.Config, error) {
+    _, err := tls.LoadX509KeyPair(certFile, keyFile)  // обязательно
+    ...
+    cfg.GetCertificate = newGetCertificateFunc(certFile, keyFile)
+    return cfg, nil
+}
+```
+
+После — проверяет глобальный провайдер:
+
+```go
+var globalCertProvider func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+
+func GetServerTLSConfig(certFile, keyFile, ...) (*tls.Config, error) {
+    if globalCertProvider == nil {
+        _, err := tls.LoadX509KeyPair(certFile, keyFile)  // только если нет провайдера
+        ...
+    }
+    if globalCertProvider != nil {
+        cfg.GetCertificate = globalCertProvider
+    } else {
+        cfg.GetCertificate = newGetCertificateFunc(certFile, keyFile)
+    }
+    return cfg, nil
+}
+```
+
+Один глобальный провайдер покрывает оба слушателя — HTTP (`httpserver`) и syslog TCP (`syslog.go`) — так как оба вызывают `netutil.GetServerTLSConfig`.
+
+### Структура Provider
+
+```go
+type Provider struct {
+    cfg      Config
+    client   *http.Client
+
+    mu       sync.Mutex
+    cert     *tls.Certificate
+    expiry   time.Time
+    issuedAt time.Time   // момент выпуска — нужен для стабильного renewDeadline
+
+    stopCh   chan struct{}
+}
+```
+
+**`GetCertificate`** — вызывается Go runtime при каждом TLS-рукопожатии:
+1. Захватывает `mu.Lock()`
+2. Проверяет `time.Now().After(renewDeadline())`
+3. Если нет — возвращает кэшированный `*tls.Certificate`
+4. Если да — вызывает `renew()` лениво (до того как фоновая горутина успела)
+
+**`backgroundRenewer`** — горутина, запущенная в `NewProvider`:
+```
+t=0      cert issued, expiry = t+TTL
+          │
+          └─ sleep until t + TTL*2/3  ← renewDeadline = expiry − lifetime/3
+                    │
+                    └─ renew() → новый cert, обновляет issuedAt и expiry
+                              └─ sleep until новый renewDeadline
+```
+
+### Критичная деталь: почему issuedAt, а не time.Until
+
+`renewDeadline()` вычисляется как `expiry − lifetime/3`, где `lifetime = expiry − issuedAt`.
+
+Если бы вместо `issuedAt` использовать `time.Until(expiry)` (оставшееся время), дедлайн пересчитывался бы с каждым вызовом функции и уменьшался быстрее, чем течёт время:
+
+```
+t=0:   expiry=t+120s, remaining=120s, deadline=t+80s     ✓
+t=80s: remaining=40s,  deadline=t+80s+13s=t+93s  ← дедлайн сместился!
+t=93s: remaining=27s,  deadline=t+93s+9s=t+102s  ← снова сдвинулся
+       ...
+       дедлайн никогда не наступает — renewal не происходит до истечения cert
+```
+
+С `issuedAt` (фиксированным в момент выпуска) `lifetime` не меняется, дедлайн стабилен:
+
+```
+t=0:   issuedAt=t, expiry=t+120s, lifetime=120s, deadline=t+80s  ✓
+t=80s: issuedAt=t, expiry=t+120s, lifetime=120s, deadline=t+80s  ✓ — горутина просыпается
+```
+
+### Fallback и деградация
+
+| Ситуация | Поведение |
+|----------|-----------|
+| Vault недоступен при старте | `logger.Fatalf` — процесс не запускается |
+| Vault недоступен при обновлении | Warn-лог, retry через 10 с; текущий cert раздаётся до его истечения |
+| Cert истёк, Vault недоступен | `GetCertificate` возвращает ошибку — TLS-рукопожатие отказывает |
+| Vault токен истёк | HTTP 403 при `renew()`, логируется; rotation через `-tls.vaultTokenFile` |
+
+### Приоритет режимов TLS
+
+```
+-tls.vaultAddr задан
+    ДА  → Vault PKI; -tlsCertFile/-tlsKeyFile игнорируются
+    НЕТ → файловые сертификаты с горячей заменой раз в секунду (исходное поведение)
+```
+
+---
+
 ## Путеводитель по задачам
 
 | Задача | С чего начать |
