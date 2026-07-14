@@ -14,6 +14,35 @@ DOCKER_BUILD ?= $(DOCKER) build
 DOCKER_COMPOSE ?= $(DOCKER) compose
 DOCKER_IMAGE_LS ?= $(DOCKER) image ls --format '{{.Repository}}:{{.Tag}}'
 
+# AIRGAP=1 — air-gapped CI: *-prod бинарники собираются локальным тулчейном Go
+# вместо вложенного `docker run` с образом local/builder (в герметичном
+# CI-контейнере с --network=none нет ни docker, ни apt для сборки builder-образа).
+# Флаги компиляции идентичны docker-варианту. Требования к окружению: кросс-gcc
+# для CGO-платформ и zip (см. deployment/jenkins/builder/Dockerfile).
+ifeq ($(AIRGAP),1)
+
+package-builder:
+	@true
+
+# GOOS/GOARCH/CGO_ENABLED приходят через окружение от целей
+# app-via-docker-<goos>-<goarch>; EXTRA_DOCKER_ENVS (CC=..., GOARM=...)
+# docker-вариант передаёт только как --env, поэтому разворачиваем сами.
+app-via-docker:
+	$(foreach v,$(EXTRA_DOCKER_ENVS),$(v)) go build $(RACE) -trimpath -buildvcs=false \
+		-ldflags "-extldflags '-static' $(GO_BUILDINFO)" \
+		-tags 'netgo osusergo' \
+		-o bin/$(APP_NAME)$(APP_SUFFIX)-prod $(PKG_PREFIX)/app/$(APP_NAME)
+
+# у windows-цели GOOS/GOARCH в окружение не экспортируются (только GOARCH
+# от release-*-windows-goarch), задаём явно
+app-via-docker-windows:
+	CGO_ENABLED=0 GOOS=windows go build $(RACE) -trimpath -buildvcs=false \
+		-ldflags "-s -w -extldflags '-static' $(GO_BUILDINFO)" \
+		-tags 'netgo osusergo' \
+		-o bin/$(APP_NAME)-windows$(APP_SUFFIX)-prod.exe $(PKG_PREFIX)/app/$(APP_NAME)
+
+else
+
 package-builder:
 	($(DOCKER_IMAGE_LS) | grep -q '$(BUILDER_IMAGE)$$') \
 		|| $(DOCKER_BUILD) \
@@ -50,6 +79,8 @@ app-via-docker-windows: package-builder
 			-ldflags "-s -w -extldflags '-static' $(GO_BUILDINFO)" \
 			-tags 'netgo osusergo' \
 			-o bin/$(APP_NAME)-windows$(APP_SUFFIX)-prod.exe $(PKG_PREFIX)/app/$(APP_NAME)
+
+endif
 
 publish-via-docker:
 	$(MAKE_PARALLEL) app-via-docker-linux-amd64 \
