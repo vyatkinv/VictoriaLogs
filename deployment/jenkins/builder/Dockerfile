@@ -1,5 +1,5 @@
 # Builder-образ для air-gapped релизной сборки (AIRGAP=1 make release,
-# см. GNUmakefile и Jenkinsfile). Поверх зеркала golang добавляет то, чего
+# см. ветку AIRGAP в deployment/docker/Makefile и Jenkinsfile). Поверх зеркала golang добавляет то, чего
 # не хватает для полного `make release` внутри одного контейнера:
 #   - gcc-aarch64-linux-gnu — CGO-кросс-компиляция linux-arm64
 #     (аналог deployment/docker/builder/Dockerfile);

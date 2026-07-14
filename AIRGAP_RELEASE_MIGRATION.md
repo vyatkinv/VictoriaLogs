@@ -6,15 +6,15 @@
 
 ## Что меняется
 
-Коммит `ce2669535` приносит три файла:
+Ветка `airgap-ci` приносит три изменения:
 
-- **`GNUmakefile`** (корень) — оверлей над Makefile: с `AIRGAP=1` цели `app-via-docker*` собирают `*-prod` бинарники локальным тулчейном Go с теми же флагами (`-trimpath`, `-extldflags '-static'`, `-tags 'netgo osusergo'`, `CC=` для CGO-платформ) вместо вложенного `docker run`, недоступного в герметичном CI-контейнере. Без `AIRGAP=1` поведение make не меняется вообще.
+- **`deployment/docker/Makefile`** — ветка `ifeq ($(AIRGAP),1)`: цели `package-builder`, `app-via-docker`, `app-via-docker-windows` собирают `*-prod` бинарники локальным тулчейном Go с теми же флагами (`-trimpath`, `-extldflags '-static'`, `-tags 'netgo osusergo'`, `CC=` для CGO-платформ) вместо вложенного `docker run`, недоступного в герметичном CI-контейнере. Без `AIRGAP=1` поведение make не меняется вообще.
 - **`deployment/jenkins/builder/Dockerfile`** — builder-образ: golang + `gcc-aarch64-linux-gnu` + `libc6-dev-arm64-cross` (CGO-кросс для linux-arm64) + `zip` (windows-архивы).
 - **`Jenkinsfile`** — стадия Build заменена на Release (`make release`), в env добавлен `AIRGAP=1`, в артефакты уходят `bin/*.tar.gz`, `bin/*.zip`, `bin/*_checksums.txt`.
 
 ## Шаг 1. Заберите код
 
-Смержите/черри-пикните коммит `ce2669535` в вашу внутреннюю ветку. Конфликтов со старым пайплайном не будет: Jenkinsfile меняется поверх прежнего, остальные файлы новые.
+Смержите ветку `airgap-ci` (или черри-пикните её CI-коммиты) в вашу внутреннюю ветку. Конфликтов со старым пайплайном не будет: Jenkinsfile меняется поверх прежнего, в апстримном `deployment/docker/Makefile` добавляется изолированная ветка условия, остальные файлы новые.
 
 ## Шаг 2. Соберите новый builder-образ (во внешнем контуре)
 
@@ -67,4 +67,4 @@ def BUILD_IMAGE = 'registry.corp.local/mirror/vl-airgap-builder:1.26-bookworm'
 
 - **Имена артефактов.** `PKG_TAG` берётся из git-тега на HEAD; без тега — из `git describe` (получится `...-heads-master-0-g<sha>.tar.gz`). Для настоящих релизов тегайте коммит — имена станут `victoria-logs-linux-amd64-v1.x.x.tar.gz`.
 - **Обновление Go.** Раньше при бампе go.mod достаточно было перезеркалить `golang:X.Y`; теперь это пересборка и перенос `vl-airgap-builder` (шаги 2–3).
-- **Откат.** Без `AIRGAP=1` GNUmakefile ничего не меняет, а старый Jenkinsfile из истории ветки продолжит работать с чистым golang-образом.
+- **Откат.** Без `AIRGAP=1` условие в deployment/docker/Makefile не активируется и make ведёт себя как в апстриме, а старый Jenkinsfile из истории ветки продолжит работать с чистым golang-образом.
