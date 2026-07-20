@@ -6,7 +6,6 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/vaulttls"
 )
@@ -60,6 +59,14 @@ func initVaultTLS() {
 		return
 	}
 
+	// Vault manages -tlsCertFile/-tlsKeyFile itself. If the user also set them
+	// explicitly, our value would be appended after theirs in the array flag and
+	// never take effect for -httpListenAddr index 0, silently ignoring Vault.
+	if isFlagSet("tlsCertFile") || isFlagSet("tlsKeyFile") {
+		logger.Fatalf("-tlsCertFile/-tlsKeyFile must not be set together with -tls.vaultAddr; " +
+			"Vault PKI manages the certificate files itself")
+	}
+
 	token := tlsVaultToken.Get()
 	cfg := vaulttls.Config{
 		Addr:        *tlsVaultAddr,
@@ -82,10 +89,34 @@ func initVaultTLS() {
 	}
 	vaultTLSProvider = p
 
-	netutil.SetGlobalCertProvider(p.GetCertificate)
+	// Wire the Vault-managed PEM files into the standard file-based TLS path.
+	// httpserver/syslog re-read these files ~once per second, so proactive
+	// renewals (which rewrite the files) are picked up automatically without
+	// patching any vendored code.
+	setFlagOrFatal("tls", "true")
+	setFlagOrFatal("tlsCertFile", p.CertFile())
+	setFlagOrFatal("tlsKeyFile", p.KeyFile())
 
 	logger.Infof("Vault PKI TLS provider ready; certificate expires at %s (renews ~1/3 before expiry)",
 		p.Expiry().Format(time.RFC3339))
+}
+
+// setFlagOrFatal sets a command-line flag programmatically, aborting on error.
+func setFlagOrFatal(name, value string) {
+	if err := flag.Set(name, value); err != nil {
+		logger.Fatalf("cannot set -%s=%q for Vault PKI TLS: %s", name, value, err)
+	}
+}
+
+// isFlagSet reports whether the named flag was explicitly set on the command line.
+func isFlagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 // stopVaultTLS stops the background renewal goroutine if Vault TLS was used.

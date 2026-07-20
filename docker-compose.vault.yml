@@ -41,7 +41,7 @@ services:
     # At ~80 s after startup the background renewer will issue a fresh certificate.
     command:
       - -httpListenAddr=:9428
-      - -tls=true
+      # -tls is enabled automatically when -tls.vaultAddr is set.
       - -tls.vaultAddr=http://vault:8200
       - -tls.vaultToken=root
       - -tls.vaultPKIPath=pki
