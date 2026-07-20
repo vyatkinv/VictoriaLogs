@@ -89,16 +89,50 @@ func initVaultTLS() {
 	}
 	vaultTLSProvider = p
 
-	// Wire the Vault-managed PEM files into the standard file-based TLS path.
-	// httpserver/syslog re-read these files ~once per second, so proactive
-	// renewals (which rewrite the files) are picked up automatically without
-	// patching any vendored code.
+	// Publish the provider so the syslog listener can obtain an in-memory
+	// tls.Config via vaulttls.ServerTLSConfig (no files for syslog).
+	vaulttls.Register(p)
+
+	// Wire the Vault-managed PEM files into the standard file-based TLS path for
+	// the HTTP listener. Its tls.Config is built inside the vendored
+	// httpserver.Serve, which only accepts file paths; httpserver re-reads them
+	// ~once per second, so renewals are picked up without patching vendored code.
 	setFlagOrFatal("tls", "true")
 	setFlagOrFatal("tlsCertFile", p.CertFile())
 	setFlagOrFatal("tlsKeyFile", p.KeyFile())
 
+	// syslog builds its own tls.Config and, when -syslog.tls is enabled, prefers
+	// the in-memory Vault provider. Reject conflicting explicit cert files so the
+	// user isn't surprised that Vault silently wins over them.
+	if syslogTLSEnabled() {
+		if isFlagSet("syslog.tlsCertFile") || isFlagSet("syslog.tlsKeyFile") {
+			logger.Fatalf("-syslog.tlsCertFile/-syslog.tlsKeyFile must not be set together with -tls.vaultAddr; " +
+				"Vault PKI serves the syslog certificate from memory")
+		}
+		logger.Infof("Vault PKI TLS also serves -syslog.listenAddr.tcp (via -syslog.tls) from memory")
+	}
+
 	logger.Infof("Vault PKI TLS provider ready; certificate expires at %s (renews ~1/3 before expiry)",
 		p.Expiry().Format(time.RFC3339))
+}
+
+// syslogTLSEnabled reports whether -syslog.tls is enabled for at least one
+// syslog TCP listener.
+func syslogTLSEnabled() bool {
+	f := flag.Lookup("syslog.tls")
+	if f == nil {
+		return false
+	}
+	ab, ok := f.Value.(*flagutil.ArrayBool)
+	if !ok {
+		return false
+	}
+	for _, v := range *ab {
+		if v {
+			return true
+		}
+	}
+	return false
 }
 
 // setFlagOrFatal sets a command-line flag programmatically, aborting on error.

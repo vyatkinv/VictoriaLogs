@@ -46,10 +46,12 @@ func main() {
 	vlstorage.Init()
 	vlselect.Init()
 
+	// Must run before vlinsert.Init(), which starts the syslog TCP listener that
+	// reads -syslog.tlsCertFile/-syslog.tlsKeyFile; initVaultTLS sets those flags.
+	initVaultTLS()
+
 	insertutil.SetLogRowsStorage(&vlstorage.Storage{})
 	vlinsert.Init()
-
-	initVaultTLS()
 
 	go httpserver.Serve(listenAddrs, requestHandler, httpserver.ServeOptions{
 		UseProxyProtocol: useProxyProtocol,

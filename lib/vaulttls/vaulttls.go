@@ -9,12 +9,79 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 )
+
+// registered holds the active Provider so listeners that build their own
+// tls.Config (syslog) can obtain an in-memory GetCertificate without files.
+// It is set once at startup (before listeners start) via Register.
+var registered atomic.Pointer[Provider]
+
+// Register publishes p as the process-wide Vault certificate provider.
+func Register(p *Provider) {
+	registered.Store(p)
+}
+
+// ServerTLSConfig returns a *tls.Config that serves the registered Vault
+// certificate via an in-memory GetCertificate callback, or (nil, nil) if no
+// Vault provider is registered. It mirrors netutil.GetServerTLSConfig but never
+// reads certificate files from disk, so the private key stays in memory.
+//
+// Intended for listeners whose tls.Config is built in project code (syslog).
+func ServerTLSConfig(tlsMinVersion string, tlsCipherSuites []string) (*tls.Config, error) {
+	p := registered.Load()
+	if p == nil {
+		return nil, nil
+	}
+	minVersion, err := netutil.ParseTLSVersion(tlsMinVersion)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse TLS min version %q: %w", tlsMinVersion, err)
+	}
+	cipherSuites, err := cipherSuitesFromNames(tlsCipherSuites)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		MinVersion:     minVersion,
+		CipherSuites:   cipherSuites,
+		GetCertificate: p.GetCertificate,
+	}, nil
+}
+
+// cipherSuitesFromNames resolves TLS cipher suite names (or numeric IDs) to
+// their uint16 identifiers. Mirrors the unexported helper in lib/netutil.
+func cipherSuitesFromNames(cipherSuiteNames []string) ([]uint16, error) {
+	if len(cipherSuiteNames) == 0 {
+		return nil, nil
+	}
+	css := tls.CipherSuites()
+	byName := make(map[string]uint16, len(css))
+	byID := make(map[uint16]bool, len(css))
+	for _, cs := range css {
+		byName[strings.ToLower(cs.Name)] = cs.ID
+		byID[cs.ID] = true
+	}
+	cipherSuites := make([]uint16, 0, len(cipherSuiteNames))
+	for _, name := range cipherSuiteNames {
+		id, ok := byName[strings.ToLower(name)]
+		if !ok {
+			idKey, err := strconv.ParseUint(name, 0, 16)
+			if err != nil || !byID[uint16(idKey)] {
+				return nil, fmt.Errorf("unsupported TLS cipher suite name: %s", name)
+			}
+			id = uint16(idKey)
+		}
+		cipherSuites = append(cipherSuites, id)
+	}
+	return cipherSuites, nil
+}
 
 // Config holds parameters for the Vault PKI certificate provider.
 type Config struct {
@@ -42,24 +109,28 @@ type Config struct {
 	RenewBefore time.Duration
 }
 
-// Provider fetches TLS certificates from a Vault PKI secrets engine,
-// writes them to on-disk PEM files and proactively renews them before
-// expiration by rewriting those files.
+// Provider fetches TLS certificates from a Vault PKI secrets engine and
+// proactively renews them before expiration.
 //
-// The certificate is served to the HTTP/syslog listeners through the
-// standard file-based path (-tlsCertFile / -tlsKeyFile), which already
-// re-reads the files roughly once per second. This avoids patching any
-// vendored code: the Provider only keeps the files up to date.
+// It exposes the certificate two ways, because VictoriaLogs has two kinds of
+// TLS listeners:
+//   - GetCertificate: an in-memory tls.Config.GetCertificate callback, used by
+//     listeners whose tls.Config we build ourselves (syslog). No files involved.
+//   - CertFile/KeyFile: on-disk PEM files, used by the HTTP listener, whose
+//     tls.Config is built inside the vendored httpserver.Serve and only accepts
+//     file paths. The vendored path re-reads these files ~once per second, so
+//     renewals are picked up without patching any vendored code.
 type Provider struct {
 	cfg    Config
 	client *http.Client
 
-	// dir holds the temp directory with the cert/key PEM files.
+	// dir holds the temp directory with the cert/key PEM files (HTTP listener).
 	dir      string
 	certPath string
 	keyPath  string
 
 	mu       sync.Mutex
+	cert     *tls.Certificate // in-memory copy, served via GetCertificate
 	expiry   time.Time
 	issuedAt time.Time // used to compute full certificate lifetime for renewDeadline
 
@@ -127,6 +198,19 @@ func (p *Provider) Stop() {
 	if p.dir != "" {
 		_ = os.RemoveAll(p.dir)
 	}
+}
+
+// GetCertificate implements tls.Config.GetCertificate, serving the current
+// in-memory certificate. Used by listeners whose tls.Config we build ourselves
+// (syslog), so their private key never touches disk. The background renewer
+// swaps p.cert under the mutex, so callers always get a fresh certificate.
+func (p *Provider) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cert == nil {
+		return nil, fmt.Errorf("vaulttls: no certificate available")
+	}
+	return p.cert, nil
 }
 
 // Expiry returns the expiration time of the currently active certificate.
@@ -265,9 +349,10 @@ func (p *Provider) renew() error {
 	certPEM := []byte(vaultResp.Data.Certificate)
 	keyPEM := []byte(vaultResp.Data.PrivateKey)
 
-	// Validate the key pair before touching the files, so a bad issuance
-	// never overwrites a currently valid certificate on disk.
-	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+	// Parse (and validate) the key pair before touching the files, so a bad
+	// issuance never overwrites a currently valid certificate on disk.
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
 		return fmt.Errorf("cannot load vault-issued key pair: %w", err)
 	}
 
@@ -280,6 +365,7 @@ func (p *Provider) renew() error {
 	logger.Infof("vaulttls: issued certificate from %s for CN=%q, expires %s (in %s)",
 		p.cfg.Addr, p.cfg.CommonName, expiry.Format(time.RFC3339), expiry.Sub(now).Round(time.Second))
 
+	p.cert = &cert
 	p.expiry = expiry
 	p.issuedAt = now
 	return nil

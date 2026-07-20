@@ -37,6 +37,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "9428:9428"
+      - "6514:6514"
     # Certificate TTL is intentionally short (2m) to allow observing hot reload.
     # At ~80 s after startup the background renewer will issue a fresh certificate.
     command:
@@ -48,6 +49,10 @@ services:
       - -tls.vaultRole=victoria-logs
       - -tls.vaultCommonName=localhost
       - -tls.vaultTTL=2m
+      # Syslog TCP over TLS: certs come from Vault because -syslog.tls is enabled
+      # and -syslog.tlsCertFile/-syslog.tlsKeyFile are intentionally left unset.
+      - -syslog.listenAddr.tcp=:6514
+      - -syslog.tls
       - -storageDataPath=/tmp/vldata
     healthcheck:
       test: ["CMD", "sh", "-c", "wget -qO- --no-check-certificate https://localhost:9428/health | grep -q OK"]

@@ -29,6 +29,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlinsert/insertutil"
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/logstorage"
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/vaulttls"
 )
 
 var (
@@ -288,12 +289,21 @@ func runUDPListener(addr string, argIdx int) {
 func runTCPListener(addr string, argIdx int) {
 	var tlsConfig *tls.Config
 	if tlsEnable.GetOptionalArg(argIdx) {
-		certFile := tlsCertFile.GetOptionalArg(argIdx)
-		keyFile := tlsKeyFile.GetOptionalArg(argIdx)
-		tc, err := netutil.GetServerTLSConfig(certFile, keyFile, *tlsMinVersion, *tlsCipherSuites)
+		// Prefer the in-memory Vault PKI certificate when a provider is registered
+		// (via -tls.vaultAddr). This keeps the private key off disk. Otherwise fall
+		// back to the file-based -syslog.tlsCertFile/-syslog.tlsKeyFile.
+		tc, err := vaulttls.ServerTLSConfig(*tlsMinVersion, *tlsCipherSuites)
 		if err != nil {
-			logger.Fatalf("cannot load TLS cert from -syslog.tlsCertFile=%q, -syslog.tlsKeyFile=%q, -syslog.tlsMinVersion=%q, -syslog.tlsCipherSuites=%q: %s",
-				certFile, keyFile, *tlsMinVersion, *tlsCipherSuites, err)
+			logger.Fatalf("cannot build Vault PKI TLS config for -syslog.listenAddr.tcp=%q: %s", addr, err)
+		}
+		if tc == nil {
+			certFile := tlsCertFile.GetOptionalArg(argIdx)
+			keyFile := tlsKeyFile.GetOptionalArg(argIdx)
+			tc, err = netutil.GetServerTLSConfig(certFile, keyFile, *tlsMinVersion, *tlsCipherSuites)
+			if err != nil {
+				logger.Fatalf("cannot load TLS cert from -syslog.tlsCertFile=%q, -syslog.tlsKeyFile=%q, -syslog.tlsMinVersion=%q, -syslog.tlsCipherSuites=%q: %s",
+					certFile, keyFile, *tlsMinVersion, *tlsCipherSuites, err)
+			}
 		}
 		tlsConfig = tc
 	}
