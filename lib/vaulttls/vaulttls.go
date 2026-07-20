@@ -159,7 +159,7 @@ func NewProvider(cfg Config) (*Provider, error) {
 		cfg.TTL = "24h"
 	}
 
-	dir, err := os.MkdirTemp("", "victoria-logs-vault-tls-")
+	dir, err := os.MkdirTemp(tlsFilesBaseDir(), "victoria-logs-vault-tls-")
 	if err != nil {
 		return nil, fmt.Errorf("cannot create temp dir for Vault TLS files: %w", err)
 	}
@@ -382,6 +382,18 @@ func (p *Provider) writePEMFiles(certPEM, keyPEM []byte) error {
 		return fmt.Errorf("cannot write TLS cert file %q: %w", p.certPath, err)
 	}
 	return nil
+}
+
+// tlsFilesBaseDir returns the base directory for the HTTP cert/key PEM files.
+// It prefers a RAM-backed tmpfs (/dev/shm on Linux) so the private key never
+// touches persistent storage; it falls back to the OS temp dir (via "") when
+// tmpfs is unavailable (non-Linux, or /dev/shm not a writable directory).
+func tlsFilesBaseDir() string {
+	const shm = "/dev/shm"
+	if fi, err := os.Stat(shm); err == nil && fi.IsDir() {
+		return shm
+	}
+	return ""
 }
 
 // writeFileAtomic writes data to a temp file in the same directory and renames

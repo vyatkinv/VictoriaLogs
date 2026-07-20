@@ -1161,7 +1161,7 @@ RunQuery
 
 **syslog (in-memory).** `syslog.go` — наш код, поэтому он вызывает `vaulttls.ServerTLSConfig()`, который возвращает `*tls.Config` с `GetCertificate = provider.GetCertificate`. Приватный ключ не покидает память; при обновлении провайдер атомарно подменяет `p.cert` под мьютексом.
 
-**HTTP (файлы).** `httpserver.Serve` — vendored и сам зовёт `netutil.GetServerTLSConfig(certFile, keyFile, …)`, инъекции `tls.Config` нет. Но vendored `newGetCertificateFunc` **перечитывает cert/key-файлы примерно раз в секунду**. Провайдер использует это: пишет PEM во временный каталог и указывает на него `-tlsCertFile`/`-tlsKeyFile` через `flag.Set(...)`. При обновлении файлы переписываются, reader подхватывает их сам.
+**HTTP (файлы).** `httpserver.Serve` — vendored и сам зовёт `netutil.GetServerTLSConfig(certFile, keyFile, …)`, инъекции `tls.Config` нет. Но vendored `newGetCertificateFunc` **перечитывает cert/key-файлы примерно раз в секунду**. Провайдер использует это: пишет PEM во временный каталог и указывает на него `-tlsCertFile`/`-tlsKeyFile` через `flag.Set(...)`. При обновлении файлы переписываются, reader подхватывает их сам. Каталог выбирается через `tlsFilesBaseDir()`: предпочтительно `/dev/shm` (tmpfs, в RAM) — приватный ключ не попадает на постоянный диск; фолбэк на `os.TempDir()`, если tmpfs недоступен.
 
 ### Поток управления при старте
 
