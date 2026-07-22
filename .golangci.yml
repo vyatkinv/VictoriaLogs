@@ -24,3 +24,10 @@ linters:
         text: '(SA(4003|1019|5011)|QF1001):'
     paths:
       - ^app/vmui/
+      # Verbatim forks of VictoriaMetrics packages. They must stay byte-identical
+      # to upstream so they can be reconciled mechanically on vendor updates,
+      # so they are not held to this project's lint settings.
+      # See lib/httpserver/UPSTREAM.md.
+      - ^lib/httpserver/
+      - ^lib/writeconcurrencylimiter/
+      - ^lib/protoparser/

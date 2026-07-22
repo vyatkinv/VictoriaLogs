@@ -13,7 +13,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlstorage/netinsert"
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlstorage/netselect"
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/logstorage"
 )
 

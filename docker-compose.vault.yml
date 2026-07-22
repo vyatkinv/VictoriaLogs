@@ -26,6 +26,7 @@ services:
       VAULT_TOKEN: root
     volumes:
       - ./scripts/vault-pki-setup.sh:/setup.sh:ro
+      - vault-approle:/creds
     entrypoint: ["/bin/sh", "/setup.sh"]
 
   victoria-logs:
@@ -37,17 +38,31 @@ services:
         condition: service_completed_successfully
     ports:
       - "9428:9428"
+      - "6514:6514"
+    volumes:
+      # role_id/secret_id written by vault-setup. Read-only: this process never
+      # needs to modify its own credentials.
+      - vault-approle:/creds:ro
     # Certificate TTL is intentionally short (2m) to allow observing hot reload.
     # At ~80 s after startup the background renewer will issue a fresh certificate.
     command:
       - -httpListenAddr=:9428
-      - -tls=true
+      # -tls is enabled automatically when -tls.vaultAddr is set.
       - -tls.vaultAddr=http://vault:8200
-      - -tls.vaultToken=root
+      # AppRole instead of a static token: no credential is passed on the command
+      # line, where it would be visible in /proc/<pid>/cmdline and `docker inspect`.
+      - -tls.vaultAuthMethod=approle
+      - -tls.vaultAuthRoleIDFile=/creds/role_id
+      - -tls.vaultAuthSecretIDFile=/creds/secret_id
+      - -tls.vaultRevokeOnShutdown=true
       - -tls.vaultPKIPath=pki
       - -tls.vaultRole=victoria-logs
       - -tls.vaultCommonName=localhost
       - -tls.vaultTTL=2m
+      # Syslog TCP over TLS: certs come from Vault because -syslog.tls is enabled
+      # and -syslog.tlsCertFile/-syslog.tlsKeyFile are intentionally left unset.
+      - -syslog.listenAddr.tcp=:6514
+      - -syslog.tls
       - -storageDataPath=/tmp/vldata
     healthcheck:
       test: ["CMD", "sh", "-c", "wget -qO- --no-check-certificate https://localhost:9428/health | grep -q OK"]
@@ -55,3 +70,7 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+
+volumes:
+  # Carries the AppRole credentials from vault-setup to victoria-logs.
+  vault-approle:

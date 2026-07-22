@@ -116,4 +116,5 @@ Tests in `apptest/tests/*_test.go` start real application binaries from `bin/` a
 - All HTTP metrics use the `vl_` prefix (e.g., `vl_http_requests_total`).
 - Log rows are grouped into streams identified by a set of stream fields. Streams are indexed separately from log content for fast stream-based filtering.
 - The special `_msg` field holds the log message body. Fields prefixed with `_` are generally internal/hidden fields.
-- Vendor directory is committed (`vendor/`); update with `make vendor-update`.
+- Vendor directory is committed (`vendor/`); update with `make vendor-update`. Never edit anything under `vendor/` — it breaks the update.
+- `lib/httpserver`, `lib/writeconcurrencylimiter` and `lib/protoparser/protoparserutil` are verbatim **forks** of VictoriaMetrics packages, not project code. Keep them byte-identical to upstream and mark every deviation with a `VL-FORK:` comment. Run `scripts/upstream-fork-diff.sh` before `make vendor-update` to see what upstream changed. Rationale and the reconciliation procedure: `lib/httpserver/UPSTREAM.md`.

@@ -23,18 +23,61 @@ vault write pki/config/urls \
 
 # Create a role with a short max_ttl so hot-reload can be demonstrated quickly.
 # cert_format=pem_bundle is NOT needed — the API returns leaf + key separately.
+# client_flag=false: the issued certificate is a server certificate only, so a
+# stolen key cannot be used to authenticate as this service elsewhere.
 vault write pki/roles/victoria-logs \
     allow_bare_domains=true \
     allow_subdomains=true \
     allow_ip_sans=true \
     allowed_domains="localhost,victoria-logs" \
+    client_flag=false \
+    server_flag=true \
     max_ttl="5m" \
     ttl="2m" \
     key_type="ec" \
     key_bits=256
 
+# ---------------------------------------------------------------------------
+# AppRole auth: victoria-logs authenticates itself instead of carrying a static
+# token that somebody has to deliver and rotate.
+
+vault auth enable approle || echo "approle already enabled"
+
+# Least privilege: issue certificates for exactly one PKI role, and revoke the
+# ones we issued (needed only for -tls.vaultRevokeOnShutdown).
+cat > /tmp/victoria-logs-policy.hcl <<'EOF'
+path "pki/issue/victoria-logs" {
+  capabilities = ["update"]
+}
+
+path "pki/revoke" {
+  capabilities = ["update"]
+}
+EOF
+vault policy write victoria-logs /tmp/victoria-logs-policy.hcl
+
+# token_ttl is deliberately shorter than the certificate TTL: the second
+# issuance (at ~80 s) then has to log in again, so the demo exercises the auth
+# path and not just the first login.
+vault write auth/approle/role/victoria-logs \
+    token_policies="victoria-logs" \
+    token_type=service \
+    token_ttl=1m \
+    token_max_ttl=5m \
+    secret_id_ttl=0
+
+# Deliver role_id/secret_id through a shared volume with owner-only permissions.
+# In production prefer a response-wrapped secret_id — see SECURITY_GUIDE.md §15.
+umask 077
+mkdir -p /creds
+vault read -field=role_id auth/approle/role/victoria-logs/role-id > /creds/role_id
+vault write -f -field=secret_id auth/approle/role/victoria-logs/secret-id > /creds/secret_id
+chmod 600 /creds/role_id /creds/secret_id
+
 echo "Vault PKI setup complete."
-echo "  Role      : victoria-logs"
+echo "  PKI role  : victoria-logs"
 echo "  Max TTL   : 5m"
 echo "  Default   : 2m"
 echo "  Renewal   : automatic at 2/3 of lifetime (~80s)"
+echo "  Auth      : approle (token_ttl=1m, so renewal re-logins)"
+echo "  Creds     : /creds/role_id, /creds/secret_id (mode 600)"
