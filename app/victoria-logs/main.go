@@ -10,7 +10,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envflag"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/pushmetrics"
@@ -19,6 +18,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlinsert/insertutil"
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlselect"
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlstorage"
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/httpserver"
 )
 
 var (

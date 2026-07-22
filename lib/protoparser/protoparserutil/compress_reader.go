@@ -1,3 +1,6 @@
+// Forked from github.com/VictoriaMetrics/VictoriaMetrics v1.146.1-0.20260630165203-c82127b6d4d1
+// See lib/httpserver/UPSTREAM.md. Local changes are marked with "VL-FORK:".
+
 package protoparserutil
 
 import (
@@ -8,6 +11,7 @@ import (
 	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zlib"
 
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/writeconcurrencylimiter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
@@ -16,7 +20,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/ioutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 )
 
 // snappy has default limit of 2_704_094_487 ( 2 GB)

@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
-
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlinsert/datadog"
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlinsert/elasticsearch"
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlinsert/internalinsert"
@@ -19,6 +17,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlinsert/opentelemetry"
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlinsert/splunk"
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlinsert/syslog"
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/httpserver"
 )
 
 var (

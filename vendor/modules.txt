@@ -22,7 +22,6 @@ github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil
 github.com/VictoriaMetrics/VictoriaMetrics/lib/fs
 github.com/VictoriaMetrics/VictoriaMetrics/lib/fs/fscore
 github.com/VictoriaMetrics/VictoriaMetrics/lib/fs/fsutil
-github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver
 github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil
 github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver
 github.com/VictoriaMetrics/VictoriaMetrics/lib/ioutil
@@ -34,7 +33,6 @@ github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue
 github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil
 github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth
 github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb
-github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/protoparserutil
 github.com/VictoriaMetrics/VictoriaMetrics/lib/pushmetrics
 github.com/VictoriaMetrics/VictoriaMetrics/lib/ratelimiter
 github.com/VictoriaMetrics/VictoriaMetrics/lib/regexutil
@@ -45,7 +43,6 @@ github.com/VictoriaMetrics/VictoriaMetrics/lib/syncwg
 github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool
 github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil
 github.com/VictoriaMetrics/VictoriaMetrics/lib/vmalertproxy
-github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter
 # github.com/VictoriaMetrics/easyproto v1.2.0
 ## explicit; go 1.18
 github.com/VictoriaMetrics/easyproto
