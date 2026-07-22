@@ -1,11 +1,10 @@
 package vaulttls
 
 import (
-	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -14,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 )
@@ -89,12 +89,8 @@ func cipherSuitesFromNames(cipherSuiteNames []string) ([]uint16, error) {
 type Config struct {
 	// Addr is the Vault server address, e.g. "https://vault:8200".
 	Addr string
-	// Token is a static Vault authentication token.
-	// Mutually exclusive with TokenFile.
-	Token string
-	// TokenFile is a path to a file containing the Vault token.
-	// Re-read on every renewal to support token rotation.
-	TokenFile string
+	// Auth describes how to authenticate in Vault. See AuthConfig.
+	Auth AuthConfig
 	// PKIPath is the Vault PKI secrets engine mount path, e.g. "pki".
 	PKIPath string
 	// Role is the Vault PKI role name used for certificate issuance.
@@ -109,6 +105,20 @@ type Config struct {
 	// RenewBefore is how early before expiration to renew the certificate.
 	// Defaults to 1/3 of the actual certificate lifetime when zero.
 	RenewBefore time.Duration
+
+	// CAFile is a path to a PEM file with CAs trusted for the connection to
+	// Vault, in addition to the system pool. Without it a MITM Vault would simply
+	// collect the credentials sent to it.
+	CAFile string
+	// ServerName overrides the hostname verified in the Vault certificate.
+	ServerName string
+	// InsecureSkipVerify disables verification of the Vault certificate.
+	InsecureSkipVerify bool
+
+	// RevokeOnShutdown makes the provider revoke the issued certificate via
+	// pki/revoke when the process stops, so a leaked private key stops being
+	// usable before the certificate expires.
+	RevokeOnShutdown bool
 }
 
 // Provider fetches TLS certificates from a Vault PKI secrets engine and
@@ -121,13 +131,23 @@ type Config struct {
 type Provider struct {
 	cfg    Config
 	client *http.Client
+	auth   *tokenSource
 
 	mu       sync.Mutex
 	cert     *tls.Certificate // in-memory copy, served via GetCertificate
+	serial   string           // serial of cert as reported by Vault, used for revocation
 	expiry   time.Time
 	issuedAt time.Time // used to compute full certificate lifetime for renewDeadline
 
-	stopCh chan struct{}
+	stopCh   chan struct{}
+	stopOnce sync.Once
+}
+
+// issuedCert is a single certificate issuance result.
+type issuedCert struct {
+	cert   *tls.Certificate
+	serial string
+	expiry time.Time
 }
 
 // NewProvider creates a Provider and issues the first certificate from Vault.
@@ -149,10 +169,24 @@ func NewProvider(cfg Config) (*Provider, error) {
 	if cfg.TTL == "" {
 		cfg.TTL = "24h"
 	}
+	if strings.HasPrefix(strings.ToLower(cfg.Addr), "http://") {
+		logger.Warnf("vaulttls: -tls.vaultAddr=%q uses plain HTTP, so the vault credentials and the issued private key "+
+			"are transmitted in cleartext; use https:// outside of test setups", cfg.Addr)
+	}
+
+	client, err := newVaultClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := newTokenSource(cfg.Addr, client, cfg.Auth)
+	if err != nil {
+		return nil, err
+	}
 
 	p := &Provider{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 30 * time.Second},
+		client: client,
+		auth:   auth,
 		stopCh: make(chan struct{}),
 	}
 	if err := p.renew(); err != nil {
@@ -162,9 +196,54 @@ func NewProvider(cfg Config) (*Provider, error) {
 	return p, nil
 }
 
-// Stop shuts down the background renewal goroutine.
+// newVaultClient builds the HTTP client used for every call to Vault.
+func newVaultClient(cfg Config) (*http.Client, error) {
+	tr := httputil.NewTransport(false, "vl_vaulttls_client")
+	if tr.TLSClientConfig == nil {
+		tr.TLSClientConfig = &tls.Config{}
+	}
+	tlsCfg := tr.TLSClientConfig
+	tlsCfg.MinVersion = tls.VersionTLS12
+	tlsCfg.ServerName = cfg.ServerName
+	tlsCfg.InsecureSkipVerify = cfg.InsecureSkipVerify
+	if cfg.InsecureSkipVerify {
+		logger.Warnf("vaulttls: -tls.vaultInsecureSkipVerify is set, so the vault certificate isn't verified; " +
+			"credentials sent to vault can be intercepted by a man-in-the-middle")
+	}
+	if cfg.CAFile != "" {
+		rootCAs, err := x509.SystemCertPool()
+		if err != nil {
+			// Not fatal: continue with a pool holding just the configured CA.
+			logger.Warnf("vaulttls: cannot load the system certificate pool: %s; trusting only -tls.vaultCAFile=%q", err, cfg.CAFile)
+			rootCAs = x509.NewCertPool()
+		}
+		data, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read -tls.vaultCAFile=%q: %w", cfg.CAFile, err)
+		}
+		if !rootCAs.AppendCertsFromPEM(data) {
+			return nil, fmt.Errorf("cannot parse any certificate from -tls.vaultCAFile=%q", cfg.CAFile)
+		}
+		tlsCfg.RootCAs = rootCAs
+	}
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: tr,
+	}, nil
+}
+
+// Stop shuts down the background renewal goroutine and releases the Vault
+// credentials held by p: the issued certificate is revoked when
+// Config.RevokeOnShutdown is set, and the login token is always revoked so it
+// cannot be replayed after the process exits.
 func (p *Provider) Stop() {
-	close(p.stopCh)
+	p.stopOnce.Do(func() {
+		close(p.stopCh)
+	})
+	if p.cfg.RevokeOnShutdown {
+		p.revokeCert()
+	}
+	p.auth.revoke()
 }
 
 // GetCertificate implements tls.Config.GetCertificate, serving the current
@@ -208,59 +287,78 @@ func (p *Provider) backgroundRenewer() {
 		p.mu.Unlock()
 
 		sleepDur := time.Until(renewAt)
-		if sleepDur > 0 {
+		if sleepDur < time.Second {
+			// Guard against a hot loop when the deadline is already in the past.
+			sleepDur = time.Second
+		}
+		select {
+		case <-time.After(sleepDur):
+		case <-p.stopCh:
+			return
+		}
+
+		if err := p.renew(); err != nil {
+			logger.Warnf("vaulttls: background renewal failed: %s; will retry in 10s", err)
 			select {
-			case <-time.After(sleepDur):
+			case <-time.After(10 * time.Second):
 			case <-p.stopCh:
 				return
 			}
 		}
-
-		p.mu.Lock()
-		// Re-check after sleep; another goroutine (GetCertificate) may have
-		// already renewed between our sleep and acquiring the lock.
-		if time.Now().After(p.renewDeadline()) {
-			if err := p.renew(); err != nil {
-				logger.Warnf("vaulttls: background renewal failed: %v; will retry in 10s", err)
-				p.mu.Unlock()
-				select {
-				case <-time.After(10 * time.Second):
-				case <-p.stopCh:
-					return
-				}
-				continue
-			}
-		}
-		p.mu.Unlock()
 	}
 }
 
-func (p *Provider) token() (string, error) {
-	if p.cfg.TokenFile != "" {
-		data, err := os.ReadFile(p.cfg.TokenFile)
-		if err != nil {
-			return "", fmt.Errorf("cannot read vault token file %q: %w", p.cfg.TokenFile, err)
-		}
-		return strings.TrimSpace(string(data)), nil
-	}
-	if p.cfg.Token == "" {
-		return "", fmt.Errorf("vault token not configured; set -tls.vaultToken or -tls.vaultTokenFile")
-	}
-	return p.cfg.Token, nil
-}
-
+// renew issues a new certificate and publishes it. The Vault round-trips happen
+// outside p.mu, so TLS handshakes served from the current certificate aren't
+// blocked for the duration of the request.
 func (p *Provider) renew() error {
-	token, err := p.token()
+	ic, err := p.fetchCert()
 	if err != nil {
 		return err
 	}
+	now := time.Now()
+	logger.Infof("vaulttls: issued certificate from %s for CN=%q, serial %s, expires %s (in %s)",
+		p.cfg.Addr, p.cfg.CommonName, ic.serial, ic.expiry.Format(time.RFC3339), ic.expiry.Sub(now).Round(time.Second))
 
-	issueURL := fmt.Sprintf("%s/v1/%s/issue/%s",
-		strings.TrimRight(p.cfg.Addr, "/"),
-		strings.Trim(p.cfg.PKIPath, "/"),
-		p.cfg.Role,
-	)
+	p.mu.Lock()
+	p.cert = ic.cert
+	p.serial = ic.serial
+	p.expiry = ic.expiry
+	p.issuedAt = now
+	p.mu.Unlock()
+	return nil
+}
 
+// fetchCert authenticates in Vault and issues a certificate. It must be called
+// without holding p.mu.
+func (p *Provider) fetchCert() (*issuedCert, error) {
+	token, err := p.auth.get(false)
+	if err != nil {
+		return nil, err
+	}
+	ic, statusCode, err := p.issueCert(token)
+	if err == nil {
+		return ic, nil
+	}
+	// p.auth.cfg.Method is the normalized method; p.cfg.Auth.Method may still be empty.
+	if p.auth.cfg.Method == AuthMethodToken || (statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden) {
+		return nil, err
+	}
+	// The cached token was revoked or expired ahead of its lease. Log in again and
+	// retry once. Pointless for a static token, which cannot be replaced by us.
+	logger.Warnf("vaulttls: vault rejected the cached token with HTTP %d; re-authenticating", statusCode)
+	token, err = p.auth.get(true)
+	if err != nil {
+		return nil, err
+	}
+	ic, _, err = p.issueCert(token)
+	return ic, err
+}
+
+// issueCert requests a certificate from the PKI engine. The HTTP status code is
+// returned alongside the error so the caller can detect authentication failures.
+func (p *Provider) issueCert(token string) (*issuedCert, int, error) {
+	issueURL := vaultURL(p.cfg.Addr, strings.Trim(p.cfg.PKIPath, "/")+"/issue/"+p.cfg.Role)
 	reqBody := map[string]string{
 		"common_name": p.cfg.CommonName,
 		"ttl":         p.cfg.TTL,
@@ -268,68 +366,62 @@ func (p *Provider) renew() error {
 	if p.cfg.AltNames != "" {
 		reqBody["alt_names"] = p.cfg.AltNames
 	}
-	bodyBytes, err := json.Marshal(reqBody)
+	respBytes, statusCode, err := doVaultRequest(p.client, http.MethodPost, issueURL, token, reqBody)
 	if err != nil {
-		return fmt.Errorf("cannot marshal vault request: %w", err)
-	}
-
-	req, err := http.NewRequest(http.MethodPost, issueURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("cannot create request to %s: %w", issueURL, err)
-	}
-	req.Header.Set("X-Vault-Token", token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("cannot contact vault at %s: %w", issueURL, err)
-	}
-	defer resp.Body.Close()
-
-	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return fmt.Errorf("cannot read vault response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		// Include first 512 bytes of the error body for diagnostics.
-		excerpt := string(respBytes)
-		if len(excerpt) > 512 {
-			excerpt = excerpt[:512]
-		}
-		return fmt.Errorf("vault returned HTTP %d: %s", resp.StatusCode, excerpt)
+		return nil, statusCode, err
 	}
 
 	var vaultResp struct {
 		Data struct {
-			Certificate string `json:"certificate"`
-			PrivateKey  string `json:"private_key"`
-			Expiration  int64  `json:"expiration"`
+			Certificate  string `json:"certificate"`
+			PrivateKey   string `json:"private_key"`
+			SerialNumber string `json:"serial_number"`
+			Expiration   int64  `json:"expiration"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(respBytes, &vaultResp); err != nil {
-		return fmt.Errorf("cannot parse vault response: %w", err)
+		return nil, statusCode, fmt.Errorf("cannot parse the vault response from %s: %w", issueURL, err)
 	}
 	if vaultResp.Data.Certificate == "" || vaultResp.Data.PrivateKey == "" {
-		return fmt.Errorf("vault response contains empty certificate or private_key")
+		return nil, statusCode, fmt.Errorf("the vault response from %s contains an empty certificate or private_key", issueURL)
 	}
-
-	certPEM := []byte(vaultResp.Data.Certificate)
-	keyPEM := []byte(vaultResp.Data.PrivateKey)
 
 	// Parse (and validate) the key pair before publishing it, so a bad issuance
 	// never replaces a currently valid certificate.
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	cert, err := tls.X509KeyPair([]byte(vaultResp.Data.Certificate), []byte(vaultResp.Data.PrivateKey))
 	if err != nil {
-		return fmt.Errorf("cannot load vault-issued key pair: %w", err)
+		return nil, statusCode, fmt.Errorf("cannot load the vault-issued key pair: %w", err)
 	}
+	return &issuedCert{
+		cert:   &cert,
+		serial: vaultResp.Data.SerialNumber,
+		expiry: time.Unix(vaultResp.Data.Expiration, 0),
+	}, statusCode, nil
+}
 
-	now := time.Now()
-	expiry := time.Unix(vaultResp.Data.Expiration, 0)
-	logger.Infof("vaulttls: issued certificate from %s for CN=%q, expires %s (in %s)",
-		p.cfg.Addr, p.cfg.CommonName, expiry.Format(time.RFC3339), expiry.Sub(now).Round(time.Second))
-
-	p.cert = &cert
-	p.expiry = expiry
-	p.issuedAt = now
-	return nil
+// revokeCert revokes the currently held certificate in Vault. Best-effort: a
+// failure only shortens the window during which the key stays usable, so it is
+// logged rather than propagated.
+func (p *Provider) revokeCert() {
+	p.mu.Lock()
+	serial := p.serial
+	p.mu.Unlock()
+	if serial == "" {
+		return
+	}
+	token, err := p.auth.get(false)
+	if err != nil {
+		logger.Warnf("vaulttls: cannot revoke certificate %s: %s", serial, err)
+		return
+	}
+	revokeURL := vaultURL(p.cfg.Addr, strings.Trim(p.cfg.PKIPath, "/")+"/revoke")
+	reqBody := map[string]string{
+		"serial_number": serial,
+	}
+	if _, _, err := doVaultRequest(p.client, http.MethodPost, revokeURL, token, reqBody); err != nil {
+		logger.Warnf("vaulttls: cannot revoke certificate %s: %s; it stays valid until %s",
+			serial, err, p.Expiry().Format(time.RFC3339))
+		return
+	}
+	logger.Infof("vaulttls: revoked certificate %s in vault", serial)
 }

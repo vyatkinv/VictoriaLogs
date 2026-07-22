@@ -9,6 +9,8 @@ set -euo pipefail
 
 VL_ADDR="https://localhost:9428"
 CURL="curl -sk --retry 5 --retry-delay 2"
+COMPOSE="docker compose -f docker-compose.vault.yml"
+VAULT_EXEC="$COMPOSE exec -T -e VAULT_ADDR=http://127.0.0.1:8200 -e VAULT_TOKEN=root vault vault"
 
 step() { echo; echo "=== $* ==="; }
 
@@ -27,6 +29,31 @@ CERT_INFO=$(echo | openssl s_client -connect localhost:9428 -servername localhos
 echo "$CERT_INFO"
 INITIAL_NOTAFTER=$(echo "$CERT_INFO" | grep notAfter | cut -d= -f2-)
 echo "  Initial cert expires: $INITIAL_NOTAFTER"
+
+# ---------------------------------------------------------------------------
+step "2b. Check AppRole authentication and credential hygiene"
+LOGS=$($COMPOSE logs victoria-logs 2>/dev/null)
+if echo "$LOGS" | grep -q 'authenticated in vault via the "approle" auth method'; then
+    echo "  PASS: authenticated via approle."
+else
+    echo "FAIL: no approle login found in the logs."
+    exit 1
+fi
+
+# Credentials must never reach the command line or the logs.
+CMDLINE=$($COMPOSE exec -T victoria-logs cat /proc/1/cmdline | tr '\0' ' ')
+if echo "$CMDLINE" | grep -qE 'vaultToken=|vaultAuthSecretID='; then
+    echo "FAIL: a credential is visible in /proc/1/cmdline: $CMDLINE"
+    exit 1
+fi
+echo "  PASS: no credential in argv."
+
+SECRET_ID=$($COMPOSE exec -T victoria-logs cat /creds/secret_id)
+if echo "$LOGS" | grep -qF "$SECRET_ID"; then
+    echo "FAIL: the secret_id leaked into the logs."
+    exit 1
+fi
+echo "  PASS: no credential in the logs."
 
 # ---------------------------------------------------------------------------
 step "3. Insert test logs"
@@ -74,4 +101,36 @@ step "7. Logs still queryable after cert rotation"
 RESULT2=$($CURL "$VL_ADDR/select/logsql/query?query=service%3Atest&limit=5")
 echo "$RESULT2" | head -c 300
 echo
+
+# ---------------------------------------------------------------------------
+step "8. Verify the renewal re-authenticated in Vault"
+# token_ttl=1m is shorter than the 2m certificate, so the second issuance must
+# have gone through a fresh AppRole login rather than a cached token.
+LOGS=$($COMPOSE logs victoria-logs 2>/dev/null)
+LOGIN_COUNT=$(echo "$LOGS" | grep -c 'authenticated in vault via the "approle" auth method' || true)
+ISSUE_COUNT=$(echo "$LOGS" | grep -c 'issued certificate from' || true)
+echo "  approle logins   : $LOGIN_COUNT"
+echo "  certificates     : $ISSUE_COUNT"
+if [ "$LOGIN_COUNT" -lt 2 ] || [ "$ISSUE_COUNT" -lt 2 ]; then
+    echo "FAIL: expected at least 2 logins and 2 issuances."
+    exit 1
+fi
+echo "  PASS: renewal re-authenticated."
+
+# ---------------------------------------------------------------------------
+step "9. Verify the certificate is revoked on shutdown"
+SERIAL=$(echo "$LOGS" | grep -o 'serial [0-9a-f:]\{10,\}' | tail -1 | awk '{print $2}')
+echo "  current serial: $SERIAL"
+$COMPOSE stop victoria-logs >/dev/null
+sleep 2
+REVOCATION_TIME=$($VAULT_EXEC read -field=revocation_time "pki/cert/$SERIAL" 2>/dev/null || echo 0)
+echo "  revocation_time: $REVOCATION_TIME"
+if [ "$REVOCATION_TIME" = "0" ] || [ -z "$REVOCATION_TIME" ]; then
+    echo "FAIL: the certificate was not revoked on shutdown."
+    exit 1
+fi
+echo "  PASS: certificate revoked (-tls.vaultRevokeOnShutdown)."
+
+echo
 echo "PASS: all checks completed successfully."
+echo "Note: victoria-logs was stopped by step 9; run '$COMPOSE up -d' to restart it."
