@@ -37,7 +37,7 @@ fork can be reconciled mechanically on upstream updates.
 
 Current local changes:
 
-- `httpserver.go` — `ServeOptions.GetCertificate` field and the corresponding
+- `httpserver.go` — `ServeOptions.GetTLSConfig` field and the corresponding
   branch in `serve()`, used by `lib/vaulttls` to serve in-memory certificates.
 - import paths rewritten from `.../VictoriaMetrics/lib/...` to
   `.../VictoriaLogs/lib/...` in `writeconcurrencylimiter/concurrencylimiter.go`

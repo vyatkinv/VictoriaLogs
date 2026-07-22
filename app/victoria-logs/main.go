@@ -19,6 +19,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlselect"
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlstorage"
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/httpserver"
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/vaulttls"
 )
 
 var (
@@ -46,8 +47,9 @@ func main() {
 	vlstorage.Init()
 	vlselect.Init()
 
-	// Must run before vlinsert.Init(), which starts the syslog TCP listener that
-	// reads -syslog.tlsCertFile/-syslog.tlsKeyFile; initVaultTLS sets those flags.
+	// Must run before vlinsert.Init(), which starts the syslog TCP listener:
+	// that listener resolves its certificate through vaulttls.ServerTLSConfig,
+	// which only works once initVaultTLS has registered the provider.
 	initVaultTLS()
 
 	insertutil.SetLogRowsStorage(&vlstorage.Storage{})
@@ -55,6 +57,9 @@ func main() {
 
 	go httpserver.Serve(listenAddrs, requestHandler, httpserver.ServeOptions{
 		UseProxyProtocol: useProxyProtocol,
+		// Serves the Vault PKI certificate from memory when -tls.vaultAddr is set;
+		// returns nil otherwise, which falls back to -tlsCertFile/-tlsKeyFile.
+		GetTLSConfig: vaulttls.ServerTLSConfig,
 	})
 	logger.Infof("started VictoriaLogs in %.3f seconds; see https://docs.victoriametrics.com/victorialogs/", time.Since(startTime).Seconds())
 

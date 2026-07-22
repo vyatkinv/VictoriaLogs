@@ -59,12 +59,12 @@ func initVaultTLS() {
 		return
 	}
 
-	// Vault manages -tlsCertFile/-tlsKeyFile itself. If the user also set them
-	// explicitly, our value would be appended after theirs in the array flag and
-	// never take effect for -httpListenAddr index 0, silently ignoring Vault.
+	// Vault serves the HTTP certificate from memory, so -tlsCertFile/-tlsKeyFile
+	// are never consulted. Reject them explicitly instead of ignoring them
+	// silently, so the user is not left believing their files are in use.
 	if isFlagSet("tlsCertFile") || isFlagSet("tlsKeyFile") {
 		logger.Fatalf("-tlsCertFile/-tlsKeyFile must not be set together with -tls.vaultAddr; " +
-			"Vault PKI manages the certificate files itself")
+			"Vault PKI serves the HTTP certificate from memory")
 	}
 
 	token := tlsVaultToken.Get()
@@ -89,17 +89,14 @@ func initVaultTLS() {
 	}
 	vaultTLSProvider = p
 
-	// Publish the provider so the syslog listener can obtain an in-memory
-	// tls.Config via vaulttls.ServerTLSConfig (no files for syslog).
+	// Publish the provider so listeners can obtain an in-memory tls.Config via
+	// vaulttls.ServerTLSConfig: syslog calls it directly, and the HTTP listener
+	// reaches it through httpserver.ServeOptions.GetTLSConfig (see main).
 	vaulttls.Register(p)
 
-	// Wire the Vault-managed PEM files into the standard file-based TLS path for
-	// the HTTP listener. Its tls.Config is built inside the vendored
-	// httpserver.Serve, which only accepts file paths; httpserver re-reads them
-	// ~once per second, so renewals are picked up without patching vendored code.
+	// -tls only selects the https scheme for -httpListenAddr; the certificate
+	// itself comes from the provider above, not from any file.
 	setFlagOrFatal("tls", "true")
-	setFlagOrFatal("tlsCertFile", p.CertFile())
-	setFlagOrFatal("tlsKeyFile", p.KeyFile())
 
 	// syslog builds its own tls.Config and, when -syslog.tls is enabled, prefers
 	// the in-memory Vault provider. Reject conflicting explicit cert files so the

@@ -108,6 +108,18 @@ type ServeOptions struct {
 	//
 	// Mostly required by http proxy servers, which performs own authorization and requests routing
 	DisableBuiltinRoutes bool
+
+	// VL-FORK: GetTLSConfig, if set, is consulted before falling back to
+	// -tlsCertFile/-tlsKeyFile. It is called once per TLS-enabled listener with
+	// that listener's -tlsMinVersion and the global -tlsCipherSuites, and may
+	// return (nil, nil) to decline, in which case the file-based path is used.
+	//
+	// This is the injection point for certificates that must never touch the
+	// filesystem; lib/vaulttls.ServerTLSConfig matches this signature and serves
+	// Vault PKI certificates from memory. Kept as a callback rather than a
+	// *tls.Config so the certificate is resolved after flag parsing and so
+	// httpserver does not depend on the certificate source.
+	GetTLSConfig func(tlsMinVersion string, tlsCipherSuites []string) (*tls.Config, error)
 }
 
 // Serve starts an http server on the given addrs with the given optional rh.
@@ -139,12 +151,25 @@ func serve(addr string, rh RequestHandler, idx int, opts ServeOptions) {
 
 	var tlsConfig *tls.Config
 	if tlsEnable.GetOptionalArg(idx) {
-		certFile := tlsCertFile.GetOptionalArg(idx)
-		keyFile := tlsKeyFile.GetOptionalArg(idx)
 		minVersion := tlsMinVersion.GetOptionalArg(idx)
-		tc, err := netutil.GetServerTLSConfig(certFile, keyFile, minVersion, *tlsCipherSuites)
-		if err != nil {
-			logger.Fatalf("cannot load TLS cert from -tlsCertFile=%q, -tlsKeyFile=%q, -tlsMinVersion=%q, -tlsCipherSuites=%q: %s", certFile, keyFile, minVersion, *tlsCipherSuites, err)
+		// VL-FORK: prefer an in-memory tls.Config supplied by the caller
+		// (Vault PKI, see lib/vaulttls) over reading certificate files from disk.
+		var tc *tls.Config
+		if opts.GetTLSConfig != nil {
+			var err error
+			tc, err = opts.GetTLSConfig(minVersion, *tlsCipherSuites)
+			if err != nil {
+				logger.Fatalf("cannot build TLS config for -httpListenAddr=%q with -tlsMinVersion=%q, -tlsCipherSuites=%q: %s", addr, minVersion, *tlsCipherSuites, err)
+			}
+		}
+		if tc == nil {
+			certFile := tlsCertFile.GetOptionalArg(idx)
+			keyFile := tlsKeyFile.GetOptionalArg(idx)
+			var err error
+			tc, err = netutil.GetServerTLSConfig(certFile, keyFile, minVersion, *tlsCipherSuites)
+			if err != nil {
+				logger.Fatalf("cannot load TLS cert from -tlsCertFile=%q, -tlsKeyFile=%q, -tlsMinVersion=%q, -tlsCipherSuites=%q: %s", certFile, keyFile, minVersion, *tlsCipherSuites, err)
+			}
 		}
 		tlsConfig = tc
 	}

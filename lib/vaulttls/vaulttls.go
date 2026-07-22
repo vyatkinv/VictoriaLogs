@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,9 +18,9 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 )
 
-// registered holds the active Provider so listeners that build their own
-// tls.Config (syslog) can obtain an in-memory GetCertificate without files.
-// It is set once at startup (before listeners start) via Register.
+// registered holds the active Provider so listeners can obtain an in-memory
+// GetCertificate without files. It is set once at startup, before any listener
+// starts, via Register.
 var registered atomic.Pointer[Provider]
 
 // Register publishes p as the process-wide Vault certificate provider.
@@ -34,7 +33,10 @@ func Register(p *Provider) {
 // Vault provider is registered. It mirrors netutil.GetServerTLSConfig but never
 // reads certificate files from disk, so the private key stays in memory.
 //
-// Intended for listeners whose tls.Config is built in project code (syslog).
+// Used by both TLS listeners: syslog calls it directly, and the HTTP listener
+// receives it as httpserver.ServeOptions.GetTLSConfig — the signature matches
+// that field deliberately. Returning (nil, nil) lets the caller fall back to
+// its file-based configuration.
 func ServerTLSConfig(tlsMinVersion string, tlsCipherSuites []string) (*tls.Config, error) {
 	p := registered.Load()
 	if p == nil {
@@ -112,22 +114,13 @@ type Config struct {
 // Provider fetches TLS certificates from a Vault PKI secrets engine and
 // proactively renews them before expiration.
 //
-// It exposes the certificate two ways, because VictoriaLogs has two kinds of
-// TLS listeners:
-//   - GetCertificate: an in-memory tls.Config.GetCertificate callback, used by
-//     listeners whose tls.Config we build ourselves (syslog). No files involved.
-//   - CertFile/KeyFile: on-disk PEM files, used by the HTTP listener, whose
-//     tls.Config is built inside the vendored httpserver.Serve and only accepts
-//     file paths. The vendored path re-reads these files ~once per second, so
-//     renewals are picked up without patching any vendored code.
+// The certificate never touches the filesystem: it is held in memory and served
+// through GetCertificate. Both kinds of TLS listener reach it that way — syslog
+// builds its tls.Config directly via ServerTLSConfig, and the HTTP listener gets
+// the same config through httpserver.ServeOptions.GetTLSConfig.
 type Provider struct {
 	cfg    Config
 	client *http.Client
-
-	// dir holds the temp directory with the cert/key PEM files (HTTP listener).
-	dir      string
-	certPath string
-	keyPath  string
 
 	mu       sync.Mutex
 	cert     *tls.Certificate // in-memory copy, served via GetCertificate
@@ -138,10 +131,8 @@ type Provider struct {
 }
 
 // NewProvider creates a Provider and issues the first certificate from Vault.
-// The certificate and key are written to PEM files under a private temp
-// directory; use CertFile and KeyFile to wire them into -tlsCertFile /
-// -tlsKeyFile. A background goroutine renews the certificate proactively.
-// Call Stop to shut down the background goroutine and remove the temp files.
+// The certificate is kept in memory only. A background goroutine renews it
+// proactively; call Stop to shut that goroutine down.
 func NewProvider(cfg Config) (*Provider, error) {
 	if cfg.Addr == "" {
 		return nil, fmt.Errorf("vault addr must not be empty")
@@ -159,45 +150,21 @@ func NewProvider(cfg Config) (*Provider, error) {
 		cfg.TTL = "24h"
 	}
 
-	dir, err := os.MkdirTemp(tlsFilesBaseDir(), "victoria-logs-vault-tls-")
-	if err != nil {
-		return nil, fmt.Errorf("cannot create temp dir for Vault TLS files: %w", err)
-	}
-
 	p := &Provider{
-		cfg:      cfg,
-		client:   &http.Client{Timeout: 30 * time.Second},
-		dir:      dir,
-		certPath: filepath.Join(dir, "cert.pem"),
-		keyPath:  filepath.Join(dir, "key.pem"),
-		stopCh:   make(chan struct{}),
+		cfg:    cfg,
+		client: &http.Client{Timeout: 30 * time.Second},
+		stopCh: make(chan struct{}),
 	}
 	if err := p.renew(); err != nil {
-		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("cannot issue initial certificate from Vault PKI at %s: %w", cfg.Addr, err)
 	}
 	go p.backgroundRenewer()
 	return p, nil
 }
 
-// CertFile returns the path to the PEM file holding the current certificate.
-// Point -tlsCertFile at it.
-func (p *Provider) CertFile() string {
-	return p.certPath
-}
-
-// KeyFile returns the path to the PEM file holding the current private key.
-// Point -tlsKeyFile at it.
-func (p *Provider) KeyFile() string {
-	return p.keyPath
-}
-
-// Stop shuts down the background renewal goroutine and removes the temp files.
+// Stop shuts down the background renewal goroutine.
 func (p *Provider) Stop() {
 	close(p.stopCh)
-	if p.dir != "" {
-		_ = os.RemoveAll(p.dir)
-	}
 }
 
 // GetCertificate implements tls.Config.GetCertificate, serving the current
@@ -349,15 +316,11 @@ func (p *Provider) renew() error {
 	certPEM := []byte(vaultResp.Data.Certificate)
 	keyPEM := []byte(vaultResp.Data.PrivateKey)
 
-	// Parse (and validate) the key pair before touching the files, so a bad
-	// issuance never overwrites a currently valid certificate on disk.
+	// Parse (and validate) the key pair before publishing it, so a bad issuance
+	// never replaces a currently valid certificate.
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return fmt.Errorf("cannot load vault-issued key pair: %w", err)
-	}
-
-	if err := p.writePEMFiles(certPEM, keyPEM); err != nil {
-		return err
 	}
 
 	now := time.Now()
@@ -368,44 +331,5 @@ func (p *Provider) renew() error {
 	p.cert = &cert
 	p.expiry = expiry
 	p.issuedAt = now
-	return nil
-}
-
-// writePEMFiles atomically writes the certificate and key PEM blobs to
-// certPath and keyPath. The key is written first, so any concurrent reader
-// that picks up the new cert also finds a matching (already-written) key.
-func (p *Provider) writePEMFiles(certPEM, keyPEM []byte) error {
-	if err := writeFileAtomic(p.keyPath, keyPEM); err != nil {
-		return fmt.Errorf("cannot write TLS key file %q: %w", p.keyPath, err)
-	}
-	if err := writeFileAtomic(p.certPath, certPEM); err != nil {
-		return fmt.Errorf("cannot write TLS cert file %q: %w", p.certPath, err)
-	}
-	return nil
-}
-
-// tlsFilesBaseDir returns the base directory for the HTTP cert/key PEM files.
-// It prefers a RAM-backed tmpfs (/dev/shm on Linux) so the private key never
-// touches persistent storage; it falls back to the OS temp dir (via "") when
-// tmpfs is unavailable (non-Linux, or /dev/shm not a writable directory).
-func tlsFilesBaseDir() string {
-	const shm = "/dev/shm"
-	if fi, err := os.Stat(shm); err == nil && fi.IsDir() {
-		return shm
-	}
-	return ""
-}
-
-// writeFileAtomic writes data to a temp file in the same directory and renames
-// it over path, so readers never observe a partially written file.
-func writeFileAtomic(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
 	return nil
 }
