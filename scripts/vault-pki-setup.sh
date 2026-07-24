@@ -37,6 +37,21 @@ vault write pki/roles/victoria-logs \
     key_type="ec" \
     key_bits=256
 
+# vlagent needs the same certificate for two purposes: it serves TLS on its own
+# -httpListenAddr and it authenticates to victoria-logs with it, hence
+# client_flag=true here and -tls.vaultClientAuth on the vlagent side.
+vault write pki/roles/vlagent \
+    allow_bare_domains=true \
+    allow_subdomains=true \
+    allow_ip_sans=true \
+    allowed_domains="localhost,vlagent" \
+    client_flag=true \
+    server_flag=true \
+    max_ttl="5m" \
+    ttl="2m" \
+    key_type="ec" \
+    key_bits=256
+
 # ---------------------------------------------------------------------------
 # AppRole auth: victoria-logs authenticates itself instead of carrying a static
 # token that somebody has to deliver and rotate.
@@ -74,6 +89,26 @@ vault read -field=role_id auth/approle/role/victoria-logs/role-id > /creds/role_
 vault write -f -field=secret_id auth/approle/role/victoria-logs/secret-id > /creds/secret_id
 chmod 600 /creds/role_id /creds/secret_id
 
+# The same, for vlagent. A separate policy and AppRole keep the two identities
+# distinct in the audit log and limit each of them to its own PKI role.
+cat > /tmp/vlagent-policy.hcl <<'EOF'
+path "pki/issue/vlagent" {
+  capabilities = ["update"]
+}
+EOF
+vault policy write vlagent /tmp/vlagent-policy.hcl
+
+vault write auth/approle/role/vlagent \
+    token_policies="vlagent" \
+    token_type=service \
+    token_ttl=1m \
+    token_max_ttl=5m \
+    secret_id_ttl=0
+
+vault read -field=role_id auth/approle/role/vlagent/role-id > /creds/vlagent_role_id
+vault write -f -field=secret_id auth/approle/role/vlagent/secret-id > /creds/vlagent_secret_id
+chmod 600 /creds/vlagent_role_id /creds/vlagent_secret_id
+
 echo "Vault PKI setup complete."
 echo "  PKI role  : victoria-logs"
 echo "  Max TTL   : 5m"
@@ -81,3 +116,5 @@ echo "  Default   : 2m"
 echo "  Renewal   : automatic at 2/3 of lifetime (~80s)"
 echo "  Auth      : approle (token_ttl=1m, so renewal re-logins)"
 echo "  Creds     : /creds/role_id, /creds/secret_id (mode 600)"
+echo "  PKI role  : vlagent (client_flag=true for mTLS to victoria-logs)"
+echo "  Creds     : /creds/vlagent_role_id, /creds/vlagent_secret_id (mode 600)"

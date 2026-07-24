@@ -1,4 +1,10 @@
-package main
+// Package vaultflags registers the -tls.vault* command-line flags and wires the
+// Vault PKI certificate provider into the process.
+//
+// It is imported by the binaries that can serve or establish TLS connections with
+// a Vault-issued certificate — victoria-logs and vlagent — so that both expose the
+// same flag surface and the same startup checks.
+package vaultflags
 
 import (
 	"flag"
@@ -16,7 +22,7 @@ var (
 	tlsVaultAddr = flag.String("tls.vaultAddr", "",
 		"Vault server address for PKI certificate issuance, e.g. https://vault:8200. "+
 			"When set, certificates are fetched from Vault PKI instead of -tlsCertFile/-tlsKeyFile. "+
-			"Requires -tls=true. See also -tls.vaultPKIPath, -tls.vaultRole, -tls.vaultCommonName.")
+			"Enables -tls unless it is set explicitly. See also -tls.vaultPKIPath, -tls.vaultRole, -tls.vaultCommonName.")
 
 	tlsVaultToken = flagutil.NewPassword("tls.vaultToken",
 		"Vault authentication token for PKI certificate issuance. Used with -tls.vaultAuthMethod=token. "+
@@ -103,26 +109,42 @@ var (
 	tlsVaultRevokeOnShutdown = flag.Bool("tls.vaultRevokeOnShutdown", false,
 		"Whether to revoke the issued certificate via pki/revoke when the process stops. "+
 			"Requires the update capability on <pki>/revoke in the Vault policy.")
+
+	tlsVaultClientAuth = flag.Bool("tls.vaultClientAuth", false,
+		"Whether to present the Vault-issued certificate as a client certificate on outgoing TLS connections "+
+			"to -storageNode and -remoteWrite.url. The PKI role must be created with client_flag=true. "+
+			"Mutually exclusive with the corresponding -storageNode.tlsCertFile and -remoteWrite.tlsCertFile.")
+
+	tlsVaultTrustPKICA = flag.Bool("tls.vaultTrustPKICA", false,
+		"Whether to verify outgoing TLS connections to -storageNode and -remoteWrite.url against the CA of "+
+			"-tls.vaultPKIPath, in addition to the system pool and to the corresponding -storageNode.tlsCAFile "+
+			"and -remoteWrite.tlsCAFile. Removes the need to distribute the CA file to every node.")
 )
 
-// vaultTLSProvider is the active Vault cert provider, stored so it can be stopped on shutdown.
-var vaultTLSProvider *vaulttls.Provider
+// provider is the active Vault cert provider, stored so it can be stopped on shutdown.
+var provider *vaulttls.Provider
 
-// initVaultTLS initialises the Vault PKI certificate provider if -tls.vaultAddr is set.
-// Must be called after flag parsing and before httpserver.Serve.
-func initVaultTLS() {
+// Init initialises the Vault PKI certificate provider if -tls.vaultAddr is set,
+// and does nothing otherwise.
+//
+// It must be called after flag parsing and before anything that establishes TLS
+// connections: the HTTP server, the syslog TCP listener and the clients of
+// -storageNode and -remoteWrite.url all resolve their certificate through the
+// provider registered here.
+func Init() {
 	if *tlsVaultAddr == "" {
 		return
 	}
 
-	// Vault serves the HTTP certificate from memory, so -tlsCertFile/-tlsKeyFile
-	// are never consulted. Reject them explicitly instead of ignoring them
-	// silently, so the user is not left believing their files are in use.
+	// Vault serves the certificate from memory, so -tlsCertFile/-tlsKeyFile are
+	// never consulted. Reject them explicitly instead of ignoring them silently,
+	// so the user is not left believing their files are in use.
 	if isFlagSet("tlsCertFile") || isFlagSet("tlsKeyFile") {
 		logger.Fatalf("-tlsCertFile/-tlsKeyFile must not be set together with -tls.vaultAddr; " +
 			"Vault PKI serves the HTTP certificate from memory")
 	}
 	checkVaultAuthFlags()
+	checkVaultClientFlags()
 
 	cfg := vaulttls.Config{
 		Addr:        *tlsVaultAddr,
@@ -147,6 +169,8 @@ func initVaultTLS() {
 		ServerName:         *tlsVaultServerName,
 		InsecureSkipVerify: *tlsVaultInsecureSkipVerify,
 		RevokeOnShutdown:   *tlsVaultRevokeOnShutdown,
+		ClientAuth:         *tlsVaultClientAuth,
+		TrustPKICA:         *tlsVaultTrustPKICA,
 	}
 	// Password flags are read lazily: their file:// and http:// forms are re-read
 	// by flagutil.Password, so a rotated secret is picked up without a restart.
@@ -166,16 +190,20 @@ func initVaultTLS() {
 	if err != nil {
 		logger.Fatalf("cannot initialise Vault PKI TLS provider: %s", err)
 	}
-	vaultTLSProvider = p
+	provider = p
 
-	// Publish the provider so listeners can obtain an in-memory tls.Config via
-	// vaulttls.ServerTLSConfig: syslog calls it directly, and the HTTP listener
-	// reaches it through httpserver.ServeOptions.GetTLSConfig (see main).
+	// Publish the provider so listeners and clients can reach it: syslog and the
+	// remote clients call vaulttls.ServerTLSConfig and vaulttls.NewRoundTripper
+	// directly, and the HTTP listener goes through httpserver.ServeOptions.GetTLSConfig.
 	vaulttls.Register(p)
 
 	// -tls only selects the https scheme for -httpListenAddr; the certificate
-	// itself comes from the provider above, not from any file.
-	setFlagOrFatal("tls", "true")
+	// itself comes from the provider above, not from any file. An explicit -tls is
+	// left alone, so that -tls=false can be used to obtain a certificate for the
+	// syslog listener or for outgoing connections only.
+	if !isFlagSet("tls") {
+		setFlagOrFatal("tls", "true")
+	}
 
 	// syslog builds its own tls.Config and, when -syslog.tls is enabled, prefers
 	// the in-memory Vault provider. Reject conflicting explicit cert files so the
@@ -190,6 +218,14 @@ func initVaultTLS() {
 
 	logger.Infof("Vault PKI TLS provider ready; certificate expires at %s (renews ~1/3 before expiry)",
 		p.Expiry().Format(time.RFC3339))
+}
+
+// Stop stops the background renewal goroutine if Vault TLS was used.
+func Stop() {
+	if provider != nil {
+		provider.Stop()
+		provider = nil
+	}
 }
 
 // tokenFlags and loginFlags list the credential flags of each auth method, so
@@ -234,6 +270,29 @@ func checkVaultAuthFlags() {
 	}
 	warnIfInlineSecret("tls.vaultToken")
 	warnIfInlineSecret("tls.vaultAuthSecretID")
+}
+
+// clientCertFlags are the per-connection client certificate flags replaced by
+// -tls.vaultClientAuth. They are arrays, so they may be set for one destination
+// and left to Vault for another; rejecting them outright keeps the resulting
+// configuration unambiguous.
+var clientCertFlags = []string{
+	"storageNode.tlsCertFile", "storageNode.tlsKeyFile",
+	"remoteWrite.tlsCertFile", "remoteWrite.tlsKeyFile",
+}
+
+// checkVaultClientFlags rejects file-based client certificates when the Vault one
+// is requested, since only one of them can be presented on a connection.
+func checkVaultClientFlags() {
+	if !*tlsVaultClientAuth {
+		return
+	}
+	for _, name := range clientCertFlags {
+		if isFlagSet(name) {
+			logger.Fatalf("-%s must not be set together with -tls.vaultClientAuth; "+
+				"Vault PKI serves the client certificate from memory", name)
+		}
+	}
 }
 
 // warnIfInlineSecret warns when a secret was passed literally on the command
@@ -307,11 +366,4 @@ func isFlagSet(name string) bool {
 		}
 	})
 	return found
-}
-
-// stopVaultTLS stops the background renewal goroutine if Vault TLS was used.
-func stopVaultTLS() {
-	if vaultTLSProvider != nil {
-		vaultTLSProvider.Stop()
-	}
 }

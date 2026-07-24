@@ -20,6 +20,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlstorage"
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/vaulttls"
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/vaulttls/vaultflags"
 )
 
 var (
@@ -44,13 +45,13 @@ func main() {
 	logger.Infof("starting VictoriaLogs at %q...", listenAddrs)
 	startTime := time.Now()
 
+	// Must run before vlstorage.Init(), which creates the -storageNode clients, and
+	// before vlinsert.Init(), which starts the syslog TCP listener: both resolve
+	// their certificate through the provider registered by vaultflags.Init().
+	vaultflags.Init()
+
 	vlstorage.Init()
 	vlselect.Init()
-
-	// Must run before vlinsert.Init(), which starts the syslog TCP listener:
-	// that listener resolves its certificate through vaulttls.ServerTLSConfig,
-	// which only works once initVaultTLS has registered the provider.
-	initVaultTLS()
 
 	insertutil.SetLogRowsStorage(&vlstorage.Storage{})
 	vlinsert.Init()
@@ -78,7 +79,7 @@ func main() {
 	vlinsert.Stop()
 	vlselect.Stop()
 	vlstorage.Stop()
-	stopVaultTLS()
+	vaultflags.Stop()
 
 	logger.Infof("the VictoriaLogs has been stopped in %.3f seconds", time.Since(startTime).Seconds())
 }

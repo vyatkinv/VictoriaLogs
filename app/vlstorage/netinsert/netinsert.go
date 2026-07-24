@@ -22,6 +22,7 @@ import (
 	"github.com/valyala/fastrand"
 
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/logstorage"
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/vaulttls"
 )
 
 // the maximum size of a single data block sent to storage node.
@@ -97,7 +98,10 @@ func newStorageNode(s *Storage, addr string, ac *promauth.Config, isTLS bool) *s
 		addr:   addr,
 		s:      s,
 		c: &http.Client{
-			Transport: ac.NewRoundTripper(tr),
+			// Adds the Vault-issued client certificate and the Vault PKI CA when
+			// -tls.vaultClientAuth / -tls.vaultTrustPKICA are set; otherwise this is
+			// ac.NewRoundTripper(tr).
+			Transport: vaulttls.NewRoundTripper(ac, tr),
 		},
 		ac: ac,
 

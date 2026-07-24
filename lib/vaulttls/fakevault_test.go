@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,6 +28,12 @@ import (
 type fakeVault struct {
 	srv *httptest.Server
 
+	// The CA of the fake PKI mount. Every issued certificate is signed by it, so
+	// tests can verify real handshakes against it.
+	caKey  *ecdsa.PrivateKey
+	caCert *x509.Certificate
+	caPEM  []byte
+
 	mu sync.Mutex
 
 	// Recorded requests.
@@ -39,6 +47,8 @@ type fakeVault struct {
 	serials        []string
 	revokedSerials []string
 	revokedTokens  []string
+	caReads        []string
+	caReadTokens   []string
 
 	// Tunables.
 	leaseDuration     int64         // lease of the token returned by login, in seconds; 0 means non-expiring
@@ -46,6 +56,7 @@ type fakeVault struct {
 	wrappedSecretID   string        // secret_id returned by sys/wrapping/unwrap
 	unwrapStatus      int           // when non-zero, unwrap fails with this status code
 	issueAuthFailures int           // number of leading issue requests answered with 403
+	emptyCAChain      bool          // when set, cert/ca_chain returns an empty certificate, as for a root-only mount
 	validTokens       map[string]bool
 }
 
@@ -56,9 +67,61 @@ func newFakeVault(t *testing.T) *fakeVault {
 		certTTL:       time.Hour,
 		validTokens:   make(map[string]bool),
 	}
+	fv.mustInitCA(t)
 	fv.srv = httptest.NewServer(fv)
 	t.Cleanup(fv.srv.Close)
 	return fv
+}
+
+// mustInitCA generates the root CA of the fake PKI mount.
+func (fv *fakeVault) mustInitCA(t *testing.T) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("cannot generate the CA key: %s", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "fake vault root CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("cannot create the CA certificate: %s", err)
+	}
+	caCert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("cannot parse the CA certificate: %s", err)
+	}
+	fv.caKey = key
+	fv.caCert = caCert
+	fv.caPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// caPool returns a pool holding the CA of the fake PKI mount.
+func (fv *fakeVault) caPool() *x509.CertPool {
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(fv.caPEM)
+	return pool
+}
+
+// mustIssueServerCert returns a certificate signed by the CA of the fake PKI
+// mount, for use by a test TLS server.
+func (fv *fakeVault) mustIssueServerCert(t *testing.T) tls.Certificate {
+	t.Helper()
+	certPEM, keyPEM, _, err := fv.issueCert(time.Hour)
+	if err != nil {
+		t.Fatalf("cannot issue the server certificate: %s", err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("cannot load the server key pair: %s", err)
+	}
+	return cert
 }
 
 func (fv *fakeVault) addr() string {
@@ -140,7 +203,7 @@ func (fv *fakeVault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeVaultError(w, http.StatusForbidden, "permission denied")
 			return
 		}
-		certPEM, keyPEM, serial, err := issueTestCert(fv.certTTL)
+		certPEM, keyPEM, serial, err := fv.issueCert(fv.certTTL)
 		if err != nil {
 			writeVaultError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -152,6 +215,18 @@ func (fv *fakeVault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"private_key":   string(keyPEM),
 				"serial_number": serial,
 				"expiration":    time.Now().Add(fv.certTTL).Unix(),
+			},
+		})
+	case strings.HasSuffix(path, "/cert/ca_chain"), strings.HasSuffix(path, "/cert/ca"):
+		fv.caReads = append(fv.caReads, path)
+		fv.caReadTokens = append(fv.caReadTokens, token)
+		certificate := string(fv.caPEM)
+		if fv.emptyCAChain && strings.HasSuffix(path, "/cert/ca_chain") {
+			certificate = ""
+		}
+		writeVaultJSON(w, map[string]any{
+			"data": map[string]any{
+				"certificate": certificate,
 			},
 		})
 	case strings.HasSuffix(path, "/revoke"):
@@ -183,9 +258,10 @@ func writeVaultError(w http.ResponseWriter, statusCode int, errMsg string) {
 	})
 }
 
-// issueTestCert returns a self-signed certificate in the same shape as the one
-// returned by the Vault PKI engine.
-func issueTestCert(ttl time.Duration) (certPEM, keyPEM []byte, serial string, err error) {
+// issueCert returns a certificate in the same shape as the one returned by the
+// Vault PKI engine: signed by the CA of the mount and usable for both server and
+// client authentication, as a role with server_flag=true and client_flag=true.
+func (fv *fakeVault) issueCert(ttl time.Duration) (certPEM, keyPEM []byte, serial string, err error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("cannot generate key: %w", err)
@@ -200,11 +276,12 @@ func issueTestCert(ttl time.Duration) (certPEM, keyPEM []byte, serial string, er
 		NotBefore:             time.Now().Add(-time.Minute),
 		NotAfter:              time.Now().Add(ttl),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 		BasicConstraintsValid: true,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, fv.caCert, &key.PublicKey, fv.caKey)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("cannot create certificate: %w", err)
 	}

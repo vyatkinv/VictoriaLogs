@@ -25,6 +25,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/logstorage"
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/vaulttls"
 )
 
 const (
@@ -126,7 +127,10 @@ func newStorageNode(s *Storage, addr string, ac *promauth.Config, isTLS bool) *s
 		addr:   addr,
 		s:      s,
 		c: &http.Client{
-			Transport: ac.NewRoundTripper(tr),
+			// Adds the Vault-issued client certificate and the Vault PKI CA when
+			// -tls.vaultClientAuth / -tls.vaultTrustPKICA are set; otherwise this is
+			// ac.NewRoundTripper(tr).
+			Transport: vaulttls.NewRoundTripper(ac, tr),
 		},
 		ac: ac,
 

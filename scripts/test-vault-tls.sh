@@ -118,7 +118,58 @@ fi
 echo "  PASS: renewal re-authenticated."
 
 # ---------------------------------------------------------------------------
-step "9. Verify the certificate is revoked on shutdown"
+step "9. vlagent: TLS from Vault on both the server and the client side"
+AGENT_ADDR="https://localhost:9429"
+until $CURL "$AGENT_ADDR/health" | grep -q OK; do
+    echo "  waiting for vlagent..."
+    sleep 3
+done
+
+AGENT_LOGS=$($COMPOSE logs vlagent 2>/dev/null)
+if ! echo "$AGENT_LOGS" | grep -q 'authenticated in vault via the "approle" auth method'; then
+    echo "FAIL: vlagent did not authenticate via approle."
+    exit 1
+fi
+if ! echo "$AGENT_LOGS" | grep -q 'loaded the CA of the .* pki mount'; then
+    echo "FAIL: vlagent did not load the PKI CA (-tls.vaultTrustPKICA)."
+    exit 1
+fi
+echo "  PASS: vlagent authenticated and loaded the PKI CA."
+
+# The vlagent listener itself must serve a Vault-issued certificate.
+AGENT_ISSUER=$(echo | openssl s_client -connect localhost:9429 -servername localhost 2>/dev/null \
+    | openssl x509 -noout -issuer 2>/dev/null)
+echo "  vlagent cert issuer: $AGENT_ISSUER"
+if ! echo "$AGENT_ISSUER" | grep -q "VictoriaLogs Demo CA"; then
+    echo "FAIL: vlagent is not serving a Vault-issued certificate."
+    exit 1
+fi
+
+# Ingest through vlagent. Reaching victoria-logs requires vlagent to verify the
+# server against the CA fetched from Vault, with no CA file configured.
+AGENT_MSG="vlagent vault mtls test $(date +%s)"
+$CURL -X POST "$AGENT_ADDR/insert/jsonline" \
+    -H "Content-Type: application/stream+json" \
+    -d "{\"_time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"_msg\":\"$AGENT_MSG\",\"service\":\"vlagent-test\",\"_stream_fields\":\"service\"}" \
+    | head -c 200
+
+FOUND=""
+for _ in $(seq 1 15); do
+    sleep 2
+    if $CURL "$VL_ADDR/select/logsql/query?query=service%3Avlagent-test&limit=5" | grep -qF "$AGENT_MSG"; then
+        FOUND=yes
+        break
+    fi
+done
+if [ -z "$FOUND" ]; then
+    echo "FAIL: the log line sent through vlagent never reached victoria-logs."
+    $COMPOSE logs --tail=30 vlagent
+    exit 1
+fi
+echo "  PASS: vlagent forwarded logs to victoria-logs over Vault-issued TLS."
+
+# ---------------------------------------------------------------------------
+step "10. Verify the certificate is revoked on shutdown"
 SERIAL=$(echo "$LOGS" | grep -o 'serial [0-9a-f:]\{10,\}' | tail -1 | awk '{print $2}')
 echo "  current serial: $SERIAL"
 $COMPOSE stop victoria-logs >/dev/null
@@ -133,4 +184,4 @@ echo "  PASS: certificate revoked (-tls.vaultRevokeOnShutdown)."
 
 echo
 echo "PASS: all checks completed successfully."
-echo "Note: victoria-logs was stopped by step 9; run '$COMPOSE up -d' to restart it."
+echo "Note: victoria-logs was stopped by step 10; run '$COMPOSE up -d' to restart it."

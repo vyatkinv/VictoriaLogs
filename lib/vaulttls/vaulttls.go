@@ -119,6 +119,16 @@ type Config struct {
 	// pki/revoke when the process stops, so a leaked private key stops being
 	// usable before the certificate expires.
 	RevokeOnShutdown bool
+
+	// ClientAuth makes outgoing connections present the Vault-issued certificate
+	// as a client certificate. The PKI role must then be created with
+	// client_flag=true, otherwise the certificate carries no clientAuth extended
+	// key usage and the peer rejects it. See NewRoundTripper.
+	ClientAuth bool
+	// TrustPKICA makes outgoing connections verify the peer against the CA of the
+	// configured PKI mount, in addition to the system pool, so that no CA file has
+	// to be distributed to the nodes. See NewRoundTripper.
+	TrustPKICA bool
 }
 
 // Provider fetches TLS certificates from a Vault PKI secrets engine and
@@ -132,6 +142,10 @@ type Provider struct {
 	cfg    Config
 	client *http.Client
 	auth   *tokenSource
+
+	// ca holds the CA bundle of the PKI mount when Config.TrustPKICA is set.
+	// It is read on every outgoing connection, hence the atomic pointer.
+	ca atomic.Pointer[caBundle]
 
 	mu       sync.Mutex
 	cert     *tls.Certificate // in-memory copy, served via GetCertificate
@@ -188,6 +202,14 @@ func NewProvider(cfg Config) (*Provider, error) {
 		client: client,
 		auth:   auth,
 		stopCh: make(chan struct{}),
+	}
+	if cfg.TrustPKICA {
+		// A missing CA bundle is a configuration error rather than a transient
+		// failure, so fail loudly instead of leaving outgoing connections without
+		// the CA they are supposed to verify against.
+		if err := p.refreshCA(); err != nil {
+			return nil, err
+		}
 	}
 	if err := p.renew(); err != nil {
 		return nil, fmt.Errorf("cannot issue initial certificate from Vault PKI at %s: %w", cfg.Addr, err)
@@ -303,6 +325,14 @@ func (p *Provider) backgroundRenewer() {
 			case <-time.After(10 * time.Second):
 			case <-p.stopCh:
 				return
+			}
+			continue
+		}
+		if p.cfg.TrustPKICA {
+			// Picks up a rotated PKI CA. Best-effort: the previously fetched bundle
+			// stays in use on failure, and it is still valid until the CA rotates.
+			if err := p.refreshCA(); err != nil {
+				logger.Warnf("vaulttls: cannot refresh the PKI CA bundle: %s; keeping the previously fetched one", err)
 			}
 		}
 	}

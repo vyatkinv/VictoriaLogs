@@ -58,6 +58,8 @@ services:
       - -tls.vaultPKIPath=pki
       - -tls.vaultRole=victoria-logs
       - -tls.vaultCommonName=localhost
+      # vlagent connects to https://victoria-logs:9428, so that name must be in the SANs.
+      - -tls.vaultAltNames=victoria-logs
       - -tls.vaultTTL=2m
       # Syslog TCP over TLS: certs come from Vault because -syslog.tls is enabled
       # and -syslog.tlsCertFile/-syslog.tlsKeyFile are intentionally left unset.
@@ -65,12 +67,54 @@ services:
       - -syslog.tls
       - -storageDataPath=/tmp/vldata
     healthcheck:
-      test: ["CMD", "sh", "-c", "wget -qO- --no-check-certificate https://localhost:9428/health | grep -q OK"]
+      # 127.0.0.1, not localhost: in the container localhost resolves to ::1 first,
+      # but the server binds IPv4 0.0.0.0, so an IPv6 probe would be refused.
+      test: ["CMD", "sh", "-c", "wget -qO- --no-check-certificate https://127.0.0.1:9428/health | grep -q OK"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # vlagent exercises the other half of the integration: it serves TLS from Vault
+  # on its own port and it talks to victoria-logs over TLS whose client
+  # certificate and CA both come from Vault, so no PEM file exists anywhere.
+  vlagent:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    entrypoint: ["vlagent"]
+    depends_on:
+      victoria-logs:
+        condition: service_healthy
+    ports:
+      - "9429:9429"
+    volumes:
+      - vault-approle:/creds:ro
+    command:
+      - -httpListenAddr=:9429
+      - -remoteWrite.url=https://victoria-logs:9428/insert/native
+      # Note the absence of -remoteWrite.tlsCAFile and -remoteWrite.tlsCertFile:
+      # both are replaced by the two Vault flags below.
+      - -tls.vaultClientAuth=true
+      - -tls.vaultTrustPKICA=true
+      - -tls.vaultAddr=http://vault:8200
+      - -tls.vaultAuthMethod=approle
+      - -tls.vaultAuthRoleIDFile=/creds/vlagent_role_id
+      - -tls.vaultAuthSecretIDFile=/creds/vlagent_secret_id
+      - -tls.vaultPKIPath=pki
+      - -tls.vaultRole=vlagent
+      - -tls.vaultCommonName=vlagent
+      - -tls.vaultAltNames=localhost
+      - -tls.vaultTTL=2m
+      - -tmpDataPath=/tmp/vlagent
+    healthcheck:
+      # 127.0.0.1, not localhost: see the note on the victoria-logs healthcheck.
+      test: ["CMD", "sh", "-c", "wget -qO- --no-check-certificate https://127.0.0.1:9429/health | grep -q OK"]
       interval: 5s
       timeout: 5s
       retries: 12
       start_period: 10s
 
 volumes:
-  # Carries the AppRole credentials from vault-setup to victoria-logs.
+  # Carries the AppRole credentials from vault-setup to victoria-logs and vlagent.
   vault-approle:

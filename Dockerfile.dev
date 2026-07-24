@@ -7,8 +7,14 @@ RUN CGO_ENABLED=0 go build -mod=vendor \
     -ldflags "-s -w" \
     -o bin/victoria-logs \
     ./app/victoria-logs/
+RUN CGO_ENABLED=0 go build -mod=vendor \
+    -ldflags "-s -w" \
+    -o bin/vlagent \
+    ./app/vlagent/
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /build/bin/victoria-logs /usr/local/bin/victoria-logs
+# vlagent shares this image; the vlagent service overrides the entrypoint.
+COPY --from=builder /build/bin/vlagent /usr/local/bin/vlagent
 ENTRYPOINT ["victoria-logs"]

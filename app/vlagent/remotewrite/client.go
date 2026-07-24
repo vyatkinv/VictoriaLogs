@@ -20,6 +20,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/ratelimiter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 	"github.com/VictoriaMetrics/metrics"
+
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/vaulttls"
 )
 
 var (
@@ -116,7 +118,10 @@ func newHTTPClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persiste
 		tr.Proxy = http.ProxyURL(pu)
 	}
 	hc := &http.Client{
-		Transport: authCfg.NewRoundTripper(tr),
+		// Adds the Vault-issued client certificate and the Vault PKI CA when
+		// -tls.vaultClientAuth / -tls.vaultTrustPKICA are set; otherwise this is
+		// authCfg.NewRoundTripper(tr).
+		Transport: vaulttls.NewRoundTripper(authCfg, tr),
 		Timeout:   sendTimeout.GetOptionalArg(argIdx),
 	}
 	c := &client{

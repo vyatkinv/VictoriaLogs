@@ -20,6 +20,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlinsert"
 	"github.com/VictoriaMetrics/VictoriaLogs/app/vlinsert/insertutil"
 	"github.com/VictoriaMetrics/VictoriaLogs/lib/httpserver"
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/vaulttls"
+	"github.com/VictoriaMetrics/VictoriaLogs/lib/vaulttls/vaultflags"
 )
 
 var (
@@ -50,6 +52,11 @@ func main() {
 	logger.Infof("starting vlagent at %q...", listenAddrs)
 	startTime := time.Now()
 
+	// Must run before remotewrite.Init(), which creates the -remoteWrite.url
+	// clients, and before vlinsert.Init(), which starts the syslog TCP listener:
+	// both resolve their certificate through the provider registered here.
+	vaultflags.Init()
+
 	insertutil.SetLogRowsStorage(&remotewrite.Storage{})
 	remotewrite.Init(*tmpDataPath)
 
@@ -59,6 +66,9 @@ func main() {
 
 	go httpserver.Serve(listenAddrs, requestHandler, httpserver.ServeOptions{
 		UseProxyProtocol: useProxyProtocol,
+		// Serves the Vault PKI certificate from memory when -tls.vaultAddr is set;
+		// returns nil otherwise, which falls back to -tlsCertFile/-tlsKeyFile.
+		GetTLSConfig: vaulttls.ServerTLSConfig,
 	})
 	logger.Infof("started vlagent in %.3f seconds", time.Since(startTime).Seconds())
 
@@ -76,6 +86,7 @@ func main() {
 	kubernetescollector.Stop()
 	filecollector.Stop()
 	remotewrite.Stop()
+	vaultflags.Stop()
 	logger.Infof("successfully shut down the webservice in %.3f seconds", time.Since(startTime).Seconds())
 	logger.Infof("successfully stopped vlagent in %.3f seconds", time.Since(startTime).Seconds())
 }
